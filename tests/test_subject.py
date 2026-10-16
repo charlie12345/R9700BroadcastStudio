@@ -83,6 +83,20 @@ def test_fuse_core_motion_band_requires_confident_matte():
     assert out[..., 988:1008, 1004:1196].min() > 0.8   # the moving subject is kept
 
 
+def test_fuse_core_gate_ramp_zone_requires_confident_matte():
+    """Just above the motion knee the envelope is only slightly open (turning head: the earcup
+    sweeps fast, the tracker lags, RVM overshoots the cup edge at low confidence). That
+    slightly-open zone must apply the same confidence rule as the fully-open band."""
+    H, W = 1080, 1920
+    core = torch.zeros(1, 1, 270, 480, device=DEV)
+    core[..., 60:240, 140:340] = 1                      # subject block (x4 = rows 240..960, cols 560..1360)
+    motion = torch.full((1, 1, 270, 480), 0.35, device=DEV)    # just above the knee: band ajar
+    alpha = torch.zeros(1, 1, H, W, device=DEV)
+    alpha[..., 984:1012, 700:1200] = 0.25               # unsure edge overshoot outside the band
+    out = fuse_core(alpha, core, motion, band_px=8.0)
+    assert out[..., 984:1012, 704:1196].max() < 0.05    # no faint arc on the earcup edge
+
+
 def test_complete_seed_recovers_missing_earcup():
     """SAM 2 often drops a dark ear cup against a dark chair. Mirroring the detected cup across the
     head's centre axis must recover it in the seed, without pulling in anything far from the subject."""

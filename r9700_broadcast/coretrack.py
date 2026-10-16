@@ -332,7 +332,10 @@ def fuse_core(alpha: torch.Tensor, core: torch.Tensor, motion: torch.Tensor | No
     H, W = alpha.shape[-2:]
     hi, lo, hi_s = _envelope(core, motion, band_px, motion_px, H, W)
     a = alpha.float()
-    opened = (hi - hi_s) > 0.5            # widened by motion, outside the static band
+    # any motion contribution at all (even just above the knee, where the band is only ajar):
+    # a turning head sweeps the earcup fast while the tracker lags, and RVM overshoots the cup
+    # edge at low confidence there. The static feather (hi == hi_s) is untouched.
+    opened = (hi - hi_s) > 0.05
     if motion is not None and bool(opened.any()):
         conf = ((a - 0.55) / 0.15).clamp(0, 1)
         hi = torch.where(opened, hi * conf, hi)
