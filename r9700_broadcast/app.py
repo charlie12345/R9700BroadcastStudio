@@ -774,14 +774,14 @@ class Main(QMainWindow):
             "choke": self._slider(f, "Choke / grow", "choke", -8, 8, 0.5, "{:+.1f}"),
             "feather": self._slider(f, "Feather", "feather", 0, 10, 0.5, "{:.1f}"),
             "clip_black": self._slider(f, "Clip black", "clip_black", 0, 0.5, 0.01),
-            "clip_white": self._slider(f, "Clip white", "clip_white", 0.5, 1, 0.01)}
-        self._slider(f, "Temporal smooth", None, 0, 0.9, 0.05, value=0.5,
+            "clip_white": self._slider(f, "Clip white", "clip_white", 0.5, 1, 0.01),
+            "temporal_smooth": self._slider(f, "Temporal smooth", "temporal_smooth", 0, 0.9, 0.05,
                      on_change=lambda x: self.pipe.command(
-                         lambda p: p.studio and setattr(p.studio.stabilizer, "strength", x)))
+                         lambda p: p.studio and setattr(p.studio.stabilizer, "strength", x)))}
         gl.addLayout(f)
         self._check(gl, "Edge colour decontamination", "decontaminate")
         reset = QPushButton("Reset matte to defaults")
-        reset.setToolTip("Choke 0, feather 0, clip black 0.02, clip white 0.98. Extreme choke/clip values make "
+        reset.setToolTip("Choke 0, feather 0, clip black 0.02, clip white 0.98, temporal 0.5. Extreme choke/clip values make "
                          "edges hard and pull the chair in; the subject lock handles headsets without them.")
 
         def do_reset():
@@ -849,10 +849,10 @@ class Main(QMainWindow):
         row.addWidget(clr)
         gl.addLayout(row)
         f = QFormLayout()
-        self._slider(f, "Sensitivity", None, 0.03, 0.3, 0.01, value=0.10,
+        self._slider(f, "Sensitivity", "plate_sensitivity", 0.03, 0.3, 0.01,
                      on_change=lambda x: self.pipe.command(
                          lambda p: p.studio and setattr(p.studio.plate, "threshold", x)))
-        self._slider(f, "Furniture removal", None, 0, 1, 0.05, value=0.0,
+        self._slider(f, "Furniture removal", "plate_furniture", 0, 1, 0.05,
                      on_change=lambda x: self.pipe.command(
                          lambda p: p.studio and setattr(p.studio.plate, "furniture", x)))
         gl.addLayout(f)

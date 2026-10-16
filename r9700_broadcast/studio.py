@@ -34,7 +34,9 @@ class Studio:
         self.settings = settings or Settings()
         self.compositor = Compositor()
         self.plate = PlateAssist()
-        self.stabilizer = TemporalStabilizer(0.5)
+        self.plate.threshold = self.settings.plate_sensitivity
+        self.plate.furniture = self.settings.plate_furniture
+        self.stabilizer = TemporalStabilizer(self.settings.temporal_smooth)
         self.semantic = None   # created lazily (only if the option is used)
         self.subject = None    # SubjectLock (MatAnyone 2 tracker process), created lazily
         self.lock = threading.RLock()

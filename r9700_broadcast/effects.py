@@ -35,6 +35,10 @@ class Settings:
     clip_black: float = 0.02    # alpha below -> 0
     clip_white: float = 0.98    # alpha above -> 1
     decontaminate: bool = True  # use predicted straight foreground colour on edges
+    temporal_smooth: float = 0.5  # stabiliser blend for per-frame engines 0..1 (RVM is recurrent already)
+    # clean plate
+    plate_sensitivity: float = 0.10  # colour distance counting as 'changed' vs the empty room
+    plate_furniture: float = 0.0     # 0 = safest; 1 = also remove plate-matching stuff right next to you
     # background
     blur_strength: float = 0.6  # 0..1
     bg_color: tuple = (0.12, 0.12, 0.14)
