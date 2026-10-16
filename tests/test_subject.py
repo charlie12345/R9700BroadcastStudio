@@ -66,6 +66,23 @@ def test_fuse_core_motion_widen_is_gated():
     assert out[..., 984:1012, 704:1196].max() > 0.6     # still admitted while the subject moves
 
 
+def test_fuse_core_motion_band_requires_confident_matte():
+    """When the band is widened by real motion, the motion-only ring must not pass the edge
+    matte at face value: a mid-confidence matte out there is usually the chair the subject just
+    uncovered (lean back: RVM reads ~0.3 on the headrest edge), while the subject itself reads
+    high. Only confident matte is admitted in the widened ring; the static band is untouched."""
+    H, W = 1080, 1920
+    core = torch.zeros(1, 1, 270, 480, device=DEV)
+    core[..., 60:240, 140:340] = 1                      # subject block (x4 = rows 240..960, cols 560..1360)
+    motion = torch.full((1, 1, 270, 480), 1.0, device=DEV)     # a real fast move: band fully open
+    alpha = torch.zeros(1, 1, H, W, device=DEV)
+    alpha[..., 984:1012, 700:900] = 0.35                # unsure matte on uncovered furniture
+    alpha[..., 984:1012, 1000:1200] = 0.9               # the subject itself, caught mid-move
+    out = fuse_core(alpha, core, motion, band_px=8.0)
+    assert out[..., 984:1012, 704:896].max() < 0.05     # furniture stays out
+    assert out[..., 988:1008, 1004:1196].min() > 0.8   # the moving subject is kept
+
+
 def test_complete_seed_recovers_missing_earcup():
     """SAM 2 often drops a dark ear cup against a dark chair. Mirroring the detected cup across the
     head's centre axis must recover it in the seed, without pulling in anything far from the subject."""

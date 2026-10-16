@@ -278,9 +278,10 @@ def _fill_holes(m: torch.Tensor) -> torch.Tensor:
 
 
 def _envelope(core: torch.Tensor, motion: torch.Tensor | None, band_px: float, motion_px: float,
-              H: int, W: int) -> tuple[torch.Tensor, torch.Tensor]:
+              H: int, W: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The tracker's (hi, lo) envelope at full resolution: a thin band around the tracked core
-    (filled), widened by motion_px where the picture moved."""
+    (filled), widened by motion_px where the picture moved. Also returns hi_static, the band
+    without any motion widening, so the caller can tell the two zones apart."""
     # the envelope comes from a ~384p matte: build it at 1/2 (720p) or 1/4 (1080p+) resolution and
     # upsample; only the final clamp runs at full resolution
     k = 4 if H >= 1000 else 2
@@ -288,7 +289,8 @@ def _envelope(core: torch.Tensor, motion: torch.Tensor | None, band_px: float, m
     c = F.interpolate(core.float(), size=(h2, w2), mode="bilinear", align_corners=False)
     c = _fill_holes(c)          # a gap in the tracked core must never punch a see-through hole
     r = max(1, int(round(band_px * H / 1080 / k)))
-    hi = _maxpool_sep(c, r)
+    hi_s = _maxpool_sep(c, r)
+    hi = hi_s
     lo = -_maxpool_sep(-c, r)
     if motion is not None:
         rm = max(r + 1, int(round((band_px + motion_px) * H / 1080 / k)))
@@ -302,7 +304,8 @@ def _envelope(core: torch.Tensor, motion: torch.Tensor | None, band_px: float, m
         lo = torch.lerp(lo, -_maxpool_sep(-c, rm), gate)
     hi = F.interpolate(hi, size=(H, W), mode="bilinear", align_corners=False)
     lo = F.interpolate(lo, size=(H, W), mode="bilinear", align_corners=False)
-    return hi, lo
+    hi_s = F.interpolate(hi_s, size=(H, W), mode="bilinear", align_corners=False)
+    return hi, lo, hi_s
 
 
 @torch.no_grad()
@@ -322,11 +325,17 @@ def fuse_core(alpha: torch.Tensor, core: torch.Tensor, motion: torch.Tensor | No
     is really moving (the tracker is 1-2 frames behind) the band widens by motion_px, so a fast
     hand or a turning head is never clipped, while static furniture stays strictly outside. The
     widening is all-or-nothing: a half-open band would show a confident-but-wrong edge matte as a
-    translucent fringe (the dark chair wing right behind the ears).
+    translucent fringe (the dark chair wing right behind the ears). And inside the motion-only
+    ring (outside the static band) only a confident edge matte is admitted: mid-confidence matte
+    out there is the furniture the subject just uncovered, while the subject itself reads high.
     """
     H, W = alpha.shape[-2:]
-    hi, lo = _envelope(core, motion, band_px, motion_px, H, W)
+    hi, lo, hi_s = _envelope(core, motion, band_px, motion_px, H, W)
     a = alpha.float()
+    opened = (hi - hi_s) > 0.5            # widened by motion, outside the static band
+    if motion is not None and bool(opened.any()):
+        conf = ((a - 0.55) / 0.15).clamp(0, 1)
+        hi = torch.where(opened, hi * conf, hi)
     return torch.minimum(torch.maximum(a, lo), hi).to(alpha.dtype)
 
 
