@@ -1,0 +1,1150 @@
+"""R9700 Broadcast Studio - Qt front end."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from dataclasses import asdict
+
+import numpy as np
+from PyQt6.QtCore import QObject, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPixmap
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog,
+                             QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QListView,
+                             QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton,
+                             QScrollArea, QSizePolicy, QSlider, QTabWidget, QVBoxLayout, QWidget)
+
+from . import backgrounds as B
+from . import uvc
+from .effects import Settings
+from .matting import ENGINES
+from .pipeline import PRESET_BY_KEY, PRESETS, LivePipeline
+
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                      "r9700-broadcast", "config.json")
+RECORD_DIR = os.path.expanduser("~/Videos/R9700 Broadcast")
+ACCENT = "#e0263c"
+
+STYLE = f"""
+QWidget {{ background: #121317; color: #e8e8ec; font-size: 13px; }}
+QFrame#bar, QFrame#strip {{ background: #181a20; border-radius: 10px; }}
+QGroupBox {{ border: 1px solid #2a2d36; border-radius: 8px; margin-top: 14px; padding: 10px 8px 8px 8px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {ACCENT}; font-weight: 600; }}
+QPushButton {{ background: #22252d; border: 1px solid #32353f; border-radius: 6px; padding: 6px 10px; }}
+QPushButton:hover {{ background: #2b2e38; }}
+QPushButton:checked {{ background: {ACCENT}; border-color: #ff5566; color: white; }}
+QPushButton#live {{ font-weight: 600; padding: 7px 14px; }}
+QComboBox {{ background: #22252d; border: 1px solid #32353f; border-radius: 6px; padding: 4px 8px; min-height: 22px; }}
+QSlider::groove:horizontal {{ height: 4px; background: #32353f; border-radius: 2px; }}
+QSlider::handle:horizontal {{ background: {ACCENT}; width: 14px; margin: -6px 0; border-radius: 7px; }}
+QSlider::sub-page:horizontal {{ background: #a01c2c; border-radius: 2px; }}
+QTabWidget::pane {{ border: 1px solid #2a2d36; border-radius: 8px; top: -1px; }}
+QTabBar::tab {{ background: #181a20; padding: 7px 12px; border-top-left-radius: 6px; border-top-right-radius: 6px; }}
+QTabBar::tab:selected {{ background: #262932; color: white; }}
+QListWidget {{ background: transparent; border: none; }}
+QListWidget::item {{ border-radius: 8px; padding: 4px; color: #c9cad3; }}
+QListWidget::item:selected {{ background: #3a1d24; border: 2px solid {ACCENT}; color: white; }}
+QListWidget::item:hover {{ background: #22252d; }}
+QLabel#hint {{ color: #8b8d9a; font-size: 11px; }}
+QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid #555a66; border-radius: 4px; background: #1d1f26; }}
+QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: #ff5566; }}
+QLabel#status {{ color: #a3a5b3; font-family: monospace; }}
+QScrollArea {{ border: none; }}
+"""
+
+SPECIAL_TILES = [
+    ("off", "Camera", "No effect"),
+    ("blur", "Blur", "Blur the real background"),
+    ("green", "Green screen", "Chroma green for OBS / vMix keying"),
+    ("blue", "Blue screen", "Chroma blue"),
+    ("transparent", "Transparent", "Real alpha via the PipeWire camera (OBS Studio)"),
+    ("remove", "Solid colour", "Flat colour background"),
+    ("matte", "Matte", "Black/white alpha matte"),
+]
+
+
+def _icon(pm: QPixmap) -> QIcon:
+    """Same pixmap for normal + selected, so Qt doesn't tint the selected thumbnail."""
+    ic = QIcon()
+    ic.addPixmap(pm, QIcon.Mode.Normal)
+    ic.addPixmap(pm, QIcon.Mode.Selected)
+    return ic
+
+
+def _hint(text):
+    lab = QLabel(text)
+    lab.setObjectName("hint")
+    lab.setWordWrap(True)
+    return lab
+
+
+def _tile_pixmap(kind: str, w=192, h=108, color=(0.12, 0.12, 0.14)) -> QPixmap:
+    pm = QPixmap(w, h)
+    pm.fill(QColor("#2a2d36"))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    if kind == "green":
+        pm.fill(QColor(0, 177, 64))
+    elif kind == "blue":
+        pm.fill(QColor(0, 71, 187))
+    elif kind == "remove":
+        pm.fill(QColor.fromRgbF(*color))
+    elif kind == "transparent":
+        for y in range(0, h, 12):
+            for x in range(0, w, 12):
+                p.fillRect(x, y, 12, 12, QColor("#cfd0d6") if (x + y) // 12 % 2 else QColor("#8d8f99"))
+    elif kind == "matte":
+        pm.fill(QColor("black"))
+    elif kind == "blur":
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(12):
+            p.setBrush(QColor.fromHsvF((0.05 + i * 0.09) % 1, 0.35, 0.6, 0.8))
+            p.drawEllipse((i * 41) % w - 12, (i * 29) % h - 12, 54, 54)
+        p.fillRect(0, 0, w, h, QColor(20, 20, 26, 110))
+    if kind != "off":
+        p.setBrush(QColor(255, 255, 255, 215))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(w // 2 - 16, 26, 32, 32)
+        p.drawRoundedRect(w // 2 - 36, 62, 72, 50, 24, 24)
+    else:
+        p.setPen(QColor("#9a9cab"))
+        p.drawText(QRect(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, "camera")
+    p.end()
+    return pm
+
+
+class _ThumbJob(QRunnable):
+    class Sig(QObject):
+        done = pyqtSignal(str, QImage)
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self.sig = _ThumbJob.Sig()
+
+    def run(self):
+        t = B.thumbnail(self.path)
+        if t is None:
+            return
+        h, w = t.shape[:2]
+        self.sig.done.emit(self.path, QImage(t.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy())
+
+
+# ---------------------------------------------------------------------------------------------
+class PreviewView(QWidget):
+    """Draws the output; transparent output is shown over a checkerboard."""
+
+    def __init__(self):
+        super().__init__()
+        self.img: QImage | None = None
+        self.alpha = False
+        self.message = "Starting…"
+        self.setMinimumSize(640, 360)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._checker = QPixmap(32, 32)
+        self._checker.fill(QColor("#8d8f99"))
+        cp = QPainter(self._checker)
+        cp.fillRect(0, 0, 16, 16, QColor("#cfd0d6"))
+        cp.fillRect(16, 16, 16, 16, QColor("#cfd0d6"))
+        cp.end()
+
+    def set_frame(self, img: QImage, alpha: bool):
+        self.img, self.alpha, self.message = img, alpha, ""
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#0b0b0e"))
+        if self.img is None:
+            p.setPen(QColor("#8b8d9a"))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.message)
+            return
+        sz = self.img.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        r = QRect((self.width() - sz.width()) // 2, (self.height() - sz.height()) // 2, sz.width(), sz.height())
+        if self.alpha:
+            p.drawTiledPixmap(r, self._checker)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.drawImage(r, self.img)
+
+
+class Bridge(QObject):
+    preview = pyqtSignal(QImage, bool)
+    status = pyqtSignal(str)
+    lock = pyqtSignal(str)
+    snapshot = pyqtSignal(object, bool)
+    error = pyqtSignal(str)
+    uncheck = pyqtSignal(str)
+
+
+# ---------------------------------------------------------------------------------------------
+class Main(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        import torch
+        self.setWindowTitle("R9700 Broadcast Studio")
+        self.resize(1560, 980)
+        self.setAcceptDrops(True)
+        self.cfg = self._load_config()
+        self.settings = Settings()
+        for k, v in self.cfg.get("settings", {}).items():
+            if hasattr(self.settings, k):
+                setattr(self.settings, k, tuple(v) if k == "bg_color" else v)
+        if self.cfg.get("config_version", 1) < 2:
+            # v2: headset/chair fixes are on by default; older configs saved them as off
+            self.settings.keep_accessories = True
+            self.settings.subject_lock = True
+            self.cfg["config_version"] = 2
+        self.library = B.Library()
+        self.n_gpus = torch.cuda.device_count()   # a GPU may be hidden (e.g. passed through to a VM)
+        self.gpus = [g for g in (self.cfg.get("gpus") or []) if int(g.split(":")[1]) < self.n_gpus] \
+            or [f"cuda:{i}" for i in range(max(1, self.n_gpus))]
+        self.preset = PRESET_BY_KEY.get(str(self.cfg.get("preset", "60")), PRESETS[1])
+        self.engine = self.cfg.get("engine", self.preset.engine)
+        if self.engine not in ENGINES:
+            self.engine = self.preset.engine
+        self.want = {"pipewire": False, "v4l2": False, "v4l2alpha": False}
+        self.provider = None
+        self.uvc_ctrls = {}
+        self.uvc_dev = None
+
+        self.bridge = Bridge()
+        self.bridge.preview.connect(lambda img, a: self.view.set_frame(img, a))
+        self.bridge.status.connect(lambda s: self.status.setText(s))
+        self.bridge.lock.connect(self._on_lock_status)
+        self.bridge.snapshot.connect(self._on_snapshot)
+        self.bridge.error.connect(self._on_error)
+        self.bridge.uncheck.connect(lambda n: {"pipewire": self.pw_btn, "v4l2": self.v4_btn,
+                                               "v4l2alpha": self.v4a_btn}[n].setChecked(False))
+        self.pipe = LivePipeline(None, on_preview=self._emit_preview, on_status=self._emit_status,
+                                 on_error=self.bridge.error.emit)
+
+        root = QWidget()
+        outer = QHBoxLayout(root)
+        left = QVBoxLayout()
+        left.addWidget(self._build_topbar())
+        self.view = PreviewView()
+        left.addWidget(self.view, 1)
+        self.status = QLabel("")
+        self.status.setObjectName("status")
+        left.addWidget(self.status)
+        self.errlabel = QLabel("")
+        self.errlabel.setStyleSheet("color:#ff6b6b")
+        self.errlabel.setWordWrap(True)
+        left.addWidget(self.errlabel)
+        left.addWidget(self._build_strip())
+        outer.addLayout(left, 1)
+        tabs = QTabWidget()
+        tabs.addTab(self._scroll(self._build_bg_tab()), "Background")
+        tabs.addTab(self._scroll(self._build_subject_tab()), "Subject")
+        tabs.addTab(self._scroll(self._build_camera_tab()), "Camera")
+        tabs.addTab(self._scroll(self._build_audio_tab()), "Audio")
+        tabs.addTab(self._scroll(self._build_output_tab()), "Output")
+        tabs.setFixedWidth(430)
+        outer.addWidget(tabs)
+        self.setCentralWidget(root)
+        self.setStyleSheet(STYLE)
+
+        for seq, fn in (("Ctrl+Q", self.close), ("Ctrl+O", self.add_backgrounds)):
+            a = QAction(self)
+            a.setShortcut(seq)
+            a.triggered.connect(fn)
+            self.addAction(a)
+        self.save_timer = QTimer(self, singleShot=True, timeout=self._save_config)
+
+        self._apply_engine()
+        self._apply_source()
+        bg = self.cfg.get("background")
+        if bg and os.path.exists(bg):
+            self._set_background(bg, switch_mode=False)
+        self._select_mode_tile(self.settings.mode)
+
+    # ---- config ---------------------------------------------------------------------------------
+    def _load_config(self):
+        try:
+            with open(CONFIG) as f:
+                return json.load(f)
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _save_config(self):
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        self.cfg.update(settings={k: v for k, v in asdict(self.settings).items() if k != "extra"},
+                        engine=self.engine, gpus=self.gpus, preset=self.preset.key)
+        with open(CONFIG, "w") as f:
+            json.dump(self.cfg, f, indent=2)
+
+    def changed(self):
+        self.save_timer.start(800)
+
+    # ---- pipeline callbacks (other threads -> Qt signals) ----------------------------------------
+    def _emit_preview(self, bgra: np.ndarray, has_alpha: bool):
+        h, w = bgra.shape[:2]
+        fmt = QImage.Format.Format_ARGB32 if has_alpha else QImage.Format.Format_RGB32
+        self.bridge.preview.emit(QImage(bgra.data, w, h, 4 * w, fmt).copy(), has_alpha)
+
+    def _emit_status(self, p: LivePipeline):
+        st, src = p.stats, p.source
+        outs = " · ".join({"pipewire": "PipeWire cam", "v4l2": "V4L2 cam", "v4l2alpha": "V4L2 alpha cam",
+                           "record": "● REC"}.get(k, k)
+                          for k in p.outputs)
+        eng = p.studio.engine_kind if p.studio else "loading…"
+        plate = ""
+        if p.studio and p.studio.plate.ready:
+            plate = " · plate ✓"
+        elif p.studio and p.studio.capturing_plate:
+            plate = " · capturing plate…"
+        self.bridge.status.emit(
+            f"in {st.fps_in:5.1f} · out {st.fps_out:5.1f} fps · {st.latency_ms:4.1f} ms · {eng}"
+            f" · {src.width}x{src.height}@{src.fps:g}" + (f" · {outs}" if outs else "") + plate
+            + (f" · dropped {st.dropped}" if st.dropped else ""))
+        if p.studio is not None:
+            self.bridge.lock.emit(p.studio.subject_status())
+
+    def _cfg_set(self, key, value):
+        self.cfg[key] = value
+        if hasattr(self, "save_timer"):
+            self.save_timer.start(500)
+
+    def _snapshot(self):
+        secs = self.snap_timer.currentData() if hasattr(self, "snap_timer") else 0
+        if secs:
+            self._snap_left = secs
+
+            def tick():
+                if self._snap_left <= 0:
+                    self.snap_btn.setText("📷 Snapshot")
+                    self.pipe.snap_cb = self.bridge.snapshot.emit
+                    return
+                self.snap_btn.setText(f"📷 {self._snap_left}…")
+                self._snap_left -= 1
+                QTimer.singleShot(1000, tick)
+            tick()
+        else:
+            self.pipe.snap_cb = self.bridge.snapshot.emit
+
+    def _on_snapshot(self, bgra, has_alpha):
+        from .thumbnail import ThumbnailDialog, save_snapshot
+        path, img = save_snapshot(bgra, has_alpha)
+        self._on_error(f"Snapshot saved: {path}")
+        dlg = ThumbnailDialog(img, path, self)
+        dlg.show()
+        self._thumb_dlg = dlg
+
+    def _on_lock_status(self, s):
+        if hasattr(self, "lock_label"):
+            icon = {"locked": "● ", "off": "○ ", "unavailable": "○ "}.get(s, "◌ ")
+            self.lock_label.setText(icon + {"locked": "Locked on to you",
+                                            "locking on": "Locking on… (look at the camera)",
+                                            "looking for subject": "Nobody in shot",
+                                            "starting": "Starting tracker on the second GPU…",
+                                            "off": "Off",
+                                            "unavailable": "MatAnyone 2 not installed"}.get(s, s))
+
+    def _on_error(self, s):
+        self.errlabel.setText(s)
+        QTimer.singleShot(10000, lambda: self.errlabel.setText("") if self.errlabel.text() == s else None)
+
+    # ---- layout helpers ------------------------------------------------------------------------
+    @staticmethod
+    def _scroll(w):
+        sa = QScrollArea()
+        sa.setWidget(w)
+        sa.setWidgetResizable(True)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        return sa
+
+    def _slider(self, form, label, attr, lo, hi, step, fmt="{:.2f}", on_change=None, value=None):
+        val = getattr(self.settings, attr) if attr else value
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(int(round(lo / step)), int(round(hi / step)))
+        s.setValue(int(round(val / step)))
+        lab = QLabel(fmt.format(val))
+        lab.setMinimumWidth(44)
+        row = QHBoxLayout()
+        row.addWidget(s, 1)
+        row.addWidget(lab)
+
+        def on(v):
+            x = v * step
+            lab.setText(fmt.format(x))
+            if attr:
+                setattr(self.settings, attr, x)
+            if on_change:
+                on_change(x)
+            self.changed()
+        s.valueChanged.connect(on)
+        form.addRow(label, row)
+        s.set_value = lambda x: s.setValue(int(round(x / step)))
+        return s
+
+    def _check(self, layout, text, attr):
+        c = QCheckBox(text)
+        c.setChecked(bool(getattr(self.settings, attr)))
+        c.toggled.connect(lambda v: (setattr(self.settings, attr, bool(v)), self.changed()))
+        layout.addWidget(c)
+        return c
+
+    # ---- top bar -------------------------------------------------------------------------------
+    def _build_topbar(self):
+        bar = QFrame()
+        bar.setObjectName("bar")
+        h = QHBoxLayout(bar)
+        self.preset_combo = QComboBox()
+        for p in PRESETS:
+            self.preset_combo.addItem(p.label, p.key)
+            self.preset_combo.setItemData(self.preset_combo.count() - 1, p.note, Qt.ItemDataRole.ToolTipRole)
+        self.preset_combo.setCurrentIndex(self.preset_combo.findData(self.preset.key))
+        self.preset_combo.activated.connect(self._on_preset)
+        h.addWidget(QLabel("Preset"))
+        h.addWidget(self.preset_combo)
+        self.cam_combo = QComboBox()
+        self.cam_combo.setMinimumWidth(200)
+        self._refresh_cameras()
+        self.cam_combo.activated.connect(self._on_camera)
+        h.addWidget(QLabel("Camera"))
+        h.addWidget(self.cam_combo, 1)
+        self.engine_combo = QComboBox()
+        for k, lab in ENGINES.items():
+            self.engine_combo.addItem(lab, k)
+        self.engine_combo.setCurrentIndex(max(0, self.engine_combo.findData(self.engine)))
+        self.engine_combo.activated.connect(self._on_engine)
+        h.addWidget(self.engine_combo)
+        h.addSpacing(8)
+        self.pw_btn = QPushButton("● PipeWire camera")
+        self.pw_btn.setObjectName("live")
+        self.pw_btn.setCheckable(True)
+        self.pw_btn.setToolTip("Native PipeWire camera: no driver, any frame rate, alpha for OBS Studio.\n"
+                               "OBS: Sources → Video Capture Device (PipeWire) → R9700 Broadcast Camera")
+        self.pw_btn.toggled.connect(lambda on: self._set_output("pipewire", on))
+        h.addWidget(self.pw_btn)
+        self.v4_btn = QPushButton("● V4L2 camera")
+        self.v4_btn.setObjectName("live")
+        self.v4_btn.setCheckable(True)
+        self.v4_btn.setToolTip("Classic /dev/video camera for Zoom, Discord, Teams (needs v4l2loopback)")
+        self.v4_btn.toggled.connect(lambda on: self._set_output("v4l2", on))
+        h.addWidget(self.v4_btn)
+        self.rec_btn = QPushButton("● Rec")
+        self.rec_btn.setObjectName("live")
+        self.rec_btn.setCheckable(True)
+        self.rec_btn.toggled.connect(self._toggle_record)
+        h.addWidget(self.rec_btn)
+        self.snap_btn = QPushButton("📷 Snapshot")
+        self.snap_btn.setToolTip("Save the current output frame at full resolution and open the thumbnail maker.\n"
+                                 "Timer: Output tab → Recording.")
+        self.snap_btn.clicked.connect(self._snapshot)
+        h.addWidget(self.snap_btn)
+        return bar
+
+    def _refresh_cameras(self):
+        from .media import list_cameras
+        cur = self.cfg.get("source")
+        self.cam_combo.clear()
+        for dev, label in list_cameras():
+            self.cam_combo.addItem(label, dev)
+        for f in self.cfg.get("recent_files", [])[-5:]:
+            if os.path.exists(f):
+                self.cam_combo.addItem("🎞 " + os.path.basename(f), f)
+        self.cam_combo.addItem("Open video file as camera…", "__open__")
+        i = self.cam_combo.findData(cur)
+        self.cam_combo.setCurrentIndex(i if i >= 0 else 0)
+
+    def _on_camera(self, _):
+        if self.cam_combo.currentData() == "__open__":
+            p, _ = QFileDialog.getOpenFileName(self, "Use a video file as the camera",
+                                               os.path.expanduser("~/Videos"), B.FILE_FILTER)
+            if not p:
+                self.cam_combo.setCurrentIndex(0)
+                return
+            self.cfg["recent_files"] = ([f for f in self.cfg.get("recent_files", []) if f != p] + [p])[-5:]
+            self.cfg["source"] = p
+            self._refresh_cameras()
+        self._apply_source()
+
+    def _on_preset(self, _):
+        self.preset = PRESET_BY_KEY[self.preset_combo.currentData()]
+        self.engine = self.preset.engine
+        self.engine_combo.setCurrentIndex(self.engine_combo.findData(self.engine))
+        self._apply_engine()
+        self._apply_source()
+        if self.exposure_lock.isChecked():
+            self._lock_exposure(True)
+        self.changed()
+
+    def _on_engine(self, _):
+        self.engine = self.engine_combo.currentData()
+        self._apply_engine()
+        self.changed()
+
+    def _apply_engine(self):
+        kind, gpus, settings = self.engine, list(self.gpus), self.settings
+        if hasattr(self, "status"):
+            self.status.setText(f"loading {ENGINES[kind]} …")
+
+        def do(p):
+            from .studio import Studio
+            if p.studio is None:
+                p.studio = Studio(kind, gpus, settings)
+            else:
+                old = p.studio.engine
+                p.studio.set_engine(kind, gpus)
+                if old is not p.studio.engine and hasattr(old, "close"):
+                    old.close()
+            if self.provider is not None:
+                p.studio.compositor.background_src = self.provider
+        self.pipe.command(do)
+
+    def _apply_source(self):
+        uri = self.cam_combo.currentData()
+        if uri == "__open__":
+            uri = None
+        self.cfg["source"] = uri
+        pr = self.preset
+        self.pipe.set_source(uri, pr.width, pr.height, pr.fps)
+        self.pipe.command(self._sync_outputs)
+        self._load_uvc(uri)
+        self.changed()
+        if not uri:
+            self.view.img = None
+            self.view.message = "No camera found - plug one in, or pick “Open video file as camera…”"
+            self.view.update()
+
+    # ---- outputs -------------------------------------------------------------------------------
+    def _set_output(self, name, on):
+        self.want[name] = on
+        self.pipe.command(self._sync_outputs)
+
+    def _sync_outputs(self, p: LivePipeline):
+        """GPU thread: (re)create sinks so they match the current source size and frame rate."""
+        if p.source is None:
+            return
+        w, h, fps = p.source.width, p.source.height, max(1, int(round(p.source.fps)))
+        for name, on in self.want.items():
+            cur = p.outputs.get(name)
+            ok = cur is not None and getattr(cur, "size", None) == (w, h) and getattr(cur, "fps", None) == fps
+            if on and not ok:
+                try:
+                    if name == "pipewire":
+                        from .pwcam import PipeWireCamera
+                        sink = PipeWireCamera(w, h, fps)
+                    else:
+                        from .v4l2out import V4L2Camera
+                        sink = V4L2Camera(w, h, fps, "ABGR32" if name == "v4l2alpha" else "YUYV")
+                    p._swap_output(name, sink)
+                except Exception as e:  # noqa: BLE001
+                    self.want[name] = False
+                    self.bridge.error.emit(str(e))
+                    self.bridge.uncheck.emit(name)
+            elif not on and cur is not None:
+                p._swap_output(name, None)
+
+    def _toggle_record(self, on):
+        if on:
+            codec = self.codec_combo.currentData()
+            audio_choice = self.audio_combo.currentData()
+            audio_adj = float(self.audio_sync.value())
+
+            def do(p):
+                from .media import Recorder
+                if p.source is None:
+                    return
+                os.makedirs(RECORD_DIR, exist_ok=True)
+                ext = "mov" if codec == "prores4444" else "mp4"
+                path = os.path.join(RECORD_DIR, time.strftime(f"%Y-%m-%d %H-%M-%S.{ext}"))
+                from .media import resolve_audio
+                fps = max(1, int(round(p.source.fps)))
+                # the picture reaches the recorder later than the sound (camera + processing):
+                # delay the audio by the measured pipeline latency + ~2 frames of camera latency
+                offset = p.stats.latency_ms + 2000 / fps + audio_adj
+                rec = Recorder(path, p.source.width, p.source.height, fps, codec,
+                               alpha=codec == "prores4444", audio=resolve_audio(audio_choice),
+                               audio_offset_ms=offset)
+                p._swap_output("record", rec)
+                self.bridge.error.emit("Recording" + (f" with sound ({rec.audio_target})" if rec.audio_target
+                                                      else " without sound") + f" → {path}")
+            self.pipe.command(do)
+        else:
+            self.pipe.remove_output("record")
+            self._on_error(f"Saved to {RECORD_DIR}")
+        self.rec_btn.setText("■ Stop" if on else "● Rec")
+
+    # ---- background strip ----------------------------------------------------------------------
+    def _build_strip(self):
+        f = QFrame()
+        f.setObjectName("strip")
+        v = QVBoxLayout(f)
+        head = QHBoxLayout()
+        t = QLabel("Backgrounds")
+        t.setStyleSheet(f"color:{ACCENT}; font-weight:600")
+        head.addWidget(t)
+        head.addWidget(_hint("Drop images, GIFs or videos anywhere on the window · right-click to remove"), 1)
+        add = QPushButton("+ Add images / videos…")
+        add.clicked.connect(self.add_backgrounds)
+        head.addWidget(add)
+        v.addLayout(head)
+        self.strip = QListWidget()
+        self.strip.setViewMode(QListView.ViewMode.IconMode)
+        self.strip.setFlow(QListView.Flow.LeftToRight)
+        self.strip.setWrapping(False)
+        self.strip.setIconSize(QSize(160, 90))
+        self.strip.setGridSize(QSize(176, 124))
+        self.strip.setFixedHeight(146)
+        self.strip.setMovement(QListView.Movement.Static)
+        self.strip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.strip.customContextMenuRequested.connect(self._strip_menu)
+        self.strip.itemClicked.connect(self._on_tile)
+        v.addWidget(self.strip)
+        self._fill_strip()
+        return f
+
+    def _fill_strip(self):
+        self.strip.clear()
+        self._tile_by_path = {}
+        for kind, label, tip in SPECIAL_TILES:
+            it = QListWidgetItem(_icon(_tile_pixmap(kind, color=self.settings.bg_color)), label)
+            it.setData(Qt.ItemDataRole.UserRole, ("mode", kind))
+            it.setToolTip(tip)
+            self.strip.addItem(it)
+        for path, builtin in self.library.items():
+            name = os.path.splitext(os.path.basename(path))[0]
+            if builtin and name[:2].isdigit():
+                name = name[3:]
+            it = QListWidgetItem(_icon(_tile_pixmap("off")),
+                                 ("▶ " if B.kind_of(path) == "video" else "") + name)
+            it.setData(Qt.ItemDataRole.UserRole, ("bg", path, builtin))
+            it.setToolTip(path)
+            self.strip.addItem(it)
+            self._tile_by_path[path] = it
+            job = _ThumbJob(path)
+            job.sig.done.connect(self._on_thumb)
+            QThreadPool.globalInstance().start(job)
+
+    def _on_thumb(self, path, img):
+        it = self._tile_by_path.get(path)
+        if it is not None:
+            it.setIcon(_icon(QPixmap.fromImage(img)))
+
+    def _on_tile(self, it):
+        d = it.data(Qt.ItemDataRole.UserRole)
+        if d[0] == "mode":
+            self._set_mode(d[1])
+            if d[1] == "transparent" and not (self.pw_btn.isChecked() or self.v4a_btn.isChecked()):
+                self._on_error("Transparent output needs an alpha-capable output: “● PipeWire camera” "
+                               "(OBS: Video Capture Device (PipeWire)) or “● V4L2 alpha camera for OBS” "
+                               "(Output tab; OBS: Video Capture Device (V4L2), 32-bit ABGR).")
+        else:
+            self._set_background(d[1])
+
+    def _strip_menu(self, pos):
+        it = self.strip.itemAt(pos)
+        if it is None:
+            return
+        d = it.data(Qt.ItemDataRole.UserRole)
+        if d[0] != "bg":
+            return
+        m = QMenu(self)
+        if not d[2]:
+            m.addAction("Remove from library", lambda: (self.library.remove(d[1]), self._fill_strip(),
+                                                         self._select_mode_tile(self.settings.mode)))
+        m.addAction("Show in folder", lambda: os.system(f'xdg-open "{os.path.dirname(d[1])}" &'))
+        m.exec(self.strip.mapToGlobal(pos))
+
+    def _select_mode_tile(self, mode):
+        for i in range(self.strip.count()):
+            d = self.strip.item(i).data(Qt.ItemDataRole.UserRole)
+            if (mode != "replace" and d[0] == "mode" and d[1] == mode) or \
+               (mode == "replace" and d[0] == "bg" and d[1] == self.cfg.get("background")):
+                self.strip.setCurrentRow(i)
+                return
+
+    def _set_mode(self, mode):
+        self.settings.mode = mode
+        self._select_mode_tile(mode)
+        self.changed()
+
+    def _set_background(self, path, switch_mode=True):
+        try:
+            prov = B.BackgroundProvider(path, self.settings.bg_fit)
+        except Exception as e:  # noqa: BLE001
+            self._on_error(f"Can't use {os.path.basename(path)}: {e}")
+            return
+        old, self.provider = self.provider, prov
+
+        def do(p):
+            if p.studio is not None:
+                p.studio.compositor.background_src = prov
+            if old is not None:
+                old.close()
+        self.pipe.command(do)
+        self.cfg["background"] = path
+        if switch_mode:
+            self.settings.mode = "replace"
+        self._select_mode_tile(self.settings.mode)
+        self.changed()
+
+    def add_backgrounds(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add backgrounds", os.path.expanduser("~/Pictures"),
+                                                B.FILE_FILTER)
+        self._import(paths)
+
+    def _import(self, paths):
+        if not paths:
+            return
+        added = self.library.add(paths)
+        known = set(self.library.user)
+        bad = [os.path.basename(p) for p in paths if os.path.abspath(p) not in known]
+        if bad:
+            self._on_error("Not a supported image/video: " + ", ".join(bad))
+        if added:
+            self._fill_strip()
+            self._set_background(added[-1])
+        elif paths and not bad:  # already in the library: just use it
+            self._set_background(os.path.abspath(paths[-1]))
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        self._import([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
+
+    # ---- tabs ----------------------------------------------------------------------------------
+    def _build_bg_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Background blur")
+        gl = QVBoxLayout(g)
+        row = QHBoxLayout()
+        f = QFormLayout()
+        self.blur_slider = self._slider(f, "Amount", "blur_strength", 0, 1, 0.01)
+        for lab, val in (("Light", 0.25), ("Medium", 0.55), ("Strong", 0.9)):
+            b = QPushButton(lab)
+            b.clicked.connect(lambda _=None, x=val: (self.blur_slider.set_value(x), self._set_mode("blur")))
+            row.addWidget(b)
+        gl.addLayout(row)
+        gl.addLayout(f)
+        gl.addWidget(_hint("Blurs your real room. The subject is excluded from the blur, so there's no halo."))
+        v.addWidget(g)
+
+        g = QGroupBox("Image / video background")
+        f = QFormLayout(g)
+        self._slider(f, "Blur it", "bg_blur", 0, 1, 0.01)
+        fit = QComboBox()
+        for k, lab in B.FITS.items():
+            fit.addItem(lab, k)
+        fit.setCurrentIndex(max(0, fit.findData(self.settings.bg_fit)))
+
+        def on_fit(_):
+            self.settings.bg_fit = fit.currentData()
+            if self.provider is not None:
+                self.provider.fit = self.settings.bg_fit
+                self.provider._cache = None
+            self.changed()
+        fit.activated.connect(on_fit)
+        f.addRow("Fit", fit)
+        self._slider(f, "Dim", "bg_dim", 0, 0.9, 0.01)
+        f.addRow(_hint("“Blur it” softens a picture or video background for a depth-of-field look. "
+                       "Videos and GIFs loop at their own frame rate."))
+        v.addWidget(g)
+
+        g = QGroupBox("Edges && colour")
+        f = QFormLayout(g)
+        self._slider(f, "Light wrap", "light_wrap", 0, 1, 0.01)
+        col = QPushButton("Solid colour…")
+        col.clicked.connect(self._pick_color)
+        f.addRow(col)
+        v.addWidget(g)
+        v.addStretch(1)
+        return w
+
+    def _pick_color(self):
+        c = QColorDialog.getColor(QColor.fromRgbF(*self.settings.bg_color), self, "Background colour")
+        if c.isValid():
+            self.settings.bg_color = (c.redF(), c.greenF(), c.blueF())
+            self._fill_strip()
+            self._set_mode("remove")
+
+    def _build_subject_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Matte")
+        gl = QVBoxLayout(g)
+        f = QFormLayout()
+        matte_sliders = {
+            "choke": self._slider(f, "Choke / grow", "choke", -8, 8, 0.5, "{:+.1f}"),
+            "feather": self._slider(f, "Feather", "feather", 0, 10, 0.5, "{:.1f}"),
+            "clip_black": self._slider(f, "Clip black", "clip_black", 0, 0.5, 0.01),
+            "clip_white": self._slider(f, "Clip white", "clip_white", 0.5, 1, 0.01)}
+        self._slider(f, "Temporal smooth", None, 0, 0.9, 0.05, value=0.5,
+                     on_change=lambda x: self.pipe.command(
+                         lambda p: p.studio and setattr(p.studio.stabilizer, "strength", x)))
+        gl.addLayout(f)
+        self._check(gl, "Edge colour decontamination", "decontaminate")
+        reset = QPushButton("Reset matte to defaults")
+        reset.setToolTip("Choke 0, feather 0, clip black 0.02, clip white 0.98. Extreme choke/clip values make "
+                         "edges hard and pull the chair in; the subject lock handles headsets without them.")
+
+        def do_reset():
+            d = Settings()
+            for k, sl in matte_sliders.items():
+                sl.set_value(getattr(d, k))
+        reset.clicked.connect(do_reset)
+        gl.addWidget(reset)
+        v.addWidget(g)
+
+        g = QGroupBox("Subject lock (MatAnyone 2)")
+        gl = QVBoxLayout(g)
+        self._check(gl, "Lock on to me: headset, mic && glasses solid, chair removed", "subject_lock")
+        row = QHBoxLayout()
+        self.lock_label = QLabel("")
+        self.lock_label.setObjectName("status")
+        row.addWidget(self.lock_label, 1)
+        relock = QPushButton("Re-lock on me")
+        relock.setToolTip("Look at the camera, then click: the tracker re-detects you and your headset.")
+        relock.clicked.connect(lambda: self.pipe.command(lambda p: p.studio and p.studio.relock_subject()))
+        row.addWidget(relock)
+        gl.addLayout(row)
+        gl.addWidget(_hint(
+            "Grounded SAM 2 finds you and anything you wear (“headphones”, “microphone”) once; MatAnyone 2 "
+            "(CVPR 2026) then tracks exactly that on the second GPU, and RVM supplies the fine hair edges inside "
+            "its outline. Nothing semi-transparent, no chair. Re-locks by itself if you leave and come back."))
+        v.addWidget(g)
+
+        g = QGroupBox("Headphones && chair")
+        gl = QVBoxLayout(g)
+        self._check(gl, "Keep headphones, mic && glasses solid (semantic guard)", "keep_accessories")
+        gl.addWidget(_hint("Fallback used while the subject lock is starting or turned off. Uses a person/chair "
+                           "segmenter on the second GPU when you have one."))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Chair"))
+        self.chair_combo = QComboBox()
+        for k, lab in (("auto", "Auto (as the AI sees it)"), ("remove", "Remove chair"), ("keep", "Keep chair")):
+            self.chair_combo.addItem(lab, k)
+        self.chair_combo.setCurrentIndex(max(0, self.chair_combo.findData(self.settings.chair)))
+
+        def on_chair(_):
+            self.settings.chair = self.chair_combo.currentData()
+            if self.settings.chair == "keep":
+                self._on_error("Keep chair uses the clean plate: Subject tab → Capture clean plate, with you out "
+                               "of shot. The chair is then cut out once and kept in every frame.")
+            self.changed()
+        self.chair_combo.activated.connect(on_chair)
+        row.addWidget(self.chair_combo, 1)
+        gl.addLayout(row)
+        gl.addWidget(_hint("Remove works straight away and is pixel-exact after a clean plate. "
+                           "Keep needs a clean plate."))
+        v.addWidget(g)
+
+        g = QGroupBox("Clean plate assist")
+        gl = QVBoxLayout(g)
+        gl.addWidget(_hint("Step out of shot and capture the empty room. Things you hold up are kept, and "
+                           "furniture the AI mistakes for you (like your chair) is removed. Keep the camera still."))
+        row = QHBoxLayout()
+        self.plate_btn = QPushButton("Capture clean plate (5 s)")
+        self.plate_btn.clicked.connect(self._capture_plate)
+        row.addWidget(self.plate_btn)
+        clr = QPushButton("Clear")
+        clr.clicked.connect(lambda: (self.pipe.command(lambda p: p.studio and p.studio.plate.clear()),
+                                     self.plate_btn.setText("Capture clean plate (5 s)")))
+        row.addWidget(clr)
+        gl.addLayout(row)
+        f = QFormLayout()
+        self._slider(f, "Sensitivity", None, 0.03, 0.3, 0.01, value=0.10,
+                     on_change=lambda x: self.pipe.command(
+                         lambda p: p.studio and setattr(p.studio.plate, "threshold", x)))
+        self._slider(f, "Furniture removal", None, 0, 1, 0.05, value=0.0,
+                     on_change=lambda x: self.pipe.command(
+                         lambda p: p.studio and setattr(p.studio.plate, "furniture", x)))
+        gl.addLayout(f)
+        gl.addWidget(_hint("Raise “Furniture removal” if the top of your chair still shows around you. "
+                           "Too high can nibble clothing that matches the wall behind it."))
+        v.addWidget(g)
+
+        g = QGroupBox("Look")
+        f = QFormLayout(g)
+        self._slider(f, "Virtual key light", "relight", 0, 1, 0.01)
+        self._slider(f, "Vignette", "vignette", 0, 1, 0.01)
+        self._slider(f, "Video noise removal", "denoise", 0, 1, 0.01)
+        v.addWidget(g)
+        v.addStretch(1)
+        return w
+
+    def _capture_plate(self):
+        self._countdown = 5
+
+        def tick():
+            if self._countdown > 0:
+                self.plate_btn.setText(f"Leave the frame… {self._countdown}")
+                self._countdown -= 1
+                QTimer.singleShot(1000, tick)
+            else:
+                self.plate_btn.setText("Captured ✓ - re-capture")
+                self.pipe.command(lambda p: p.studio and p.studio.start_plate_capture())
+        tick()
+
+    def _build_camera_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Smart framing (software)")
+        gl = QVBoxLayout(g)
+        self._check(gl, "Auto frame: crop and follow me", "auto_frame")
+        f = QFormLayout()
+        self._slider(f, "Zoom", "frame_zoom", 1, 3, 0.05)
+        self._slider(f, "Smoothness", "frame_speed", 0.02, 0.3, 0.01)
+        gl.addLayout(f)
+        self._check(gl, "Mirror", "mirror")
+        v.addWidget(g)
+        self.uvc_box = QGroupBox("Camera hardware")
+        self.uvc_layout = QVBoxLayout(self.uvc_box)
+        v.addWidget(self.uvc_box)
+        g = QGroupBox("High frame rate")
+        gl = QVBoxLayout(g)
+        self.exposure_lock = QCheckBox("Lock exposure to the frame rate")
+        self.exposure_lock.toggled.connect(self._lock_exposure)
+        gl.addWidget(self.exposure_lock)
+        gl.addWidget(_hint("In a dim room, auto exposure can lengthen the shutter and quietly drop a 100/120 fps "
+                           "camera to 30. This caps the exposure at one frame (raise Gain or add light)."))
+        v.addWidget(g)
+        v.addStretch(1)
+        return w
+
+    def _load_uvc(self, dev):
+        while self.uvc_layout.count():
+            it = self.uvc_layout.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+            elif it.layout():
+                QWidget().setLayout(it.layout())
+        self.uvc_dev = dev
+        self.uvc_ctrls = uvc.list_controls(dev) if dev and dev.startswith("/dev/video") else {}
+        self._uvc_sliders = {}
+        if not self.uvc_ctrls:
+            self.uvc_layout.addWidget(_hint("No hardware controls for this source."))
+            return
+        f = QFormLayout()
+        for name, label in (("zoom_absolute", "Zoom"), ("pan_absolute", "Pan (gimbal)"),
+                            ("tilt_absolute", "Tilt (gimbal)"), ("brightness", "Brightness"), ("gain", "Gain"),
+                            ("sharpness", "Sharpness"), ("white_balance_temperature", "White balance K")):
+            c = self.uvc_ctrls.get(name)
+            if c is None or c.type != "int":
+                continue
+            s = QSlider(Qt.Orientation.Horizontal)
+            step = max(1, c.step)
+            s.setRange(c.min // step, c.max // step)
+            s.setValue(c.value // step)
+            s.valueChanged.connect(lambda val, n=name, st=step: uvc.set_control(self.uvc_dev, n, val * st))
+            f.addRow(label, s)
+            self._uvc_sliders[name] = s
+        self.uvc_layout.addLayout(f)
+        row = QHBoxLayout()
+        if "pan_absolute" in self.uvc_ctrls:
+            b = QPushButton("Centre gimbal")
+            b.clicked.connect(lambda: [self._uvc_sliders[n].setValue(0) for n in ("pan_absolute", "tilt_absolute")
+                                       if n in self._uvc_sliders])
+            row.addWidget(b)
+        for name, label in (("focus_automatic_continuous", "Autofocus"), ("white_balance_automatic", "Auto WB")):
+            c = self.uvc_ctrls.get(name)
+            if c is not None:
+                cb = QCheckBox(label)
+                cb.setChecked(bool(c.value))
+                cb.toggled.connect(lambda on, n=name: uvc.set_control(self.uvc_dev, n, int(on)))
+                row.addWidget(cb)
+        self.uvc_layout.addLayout(row)
+        self.uvc_layout.addWidget(_hint("OBSBOT Tiny: pan/tilt drive the real gimbal and zoom is the camera's own "
+                                        "zoom. These are standard UVC controls, so OBSBOT Center isn't needed."))
+
+    def _lock_exposure(self, on):
+        if not self.uvc_dev or not self.uvc_ctrls:
+            return
+        if on:
+            uvc.lock_exposure_for_fps(self.uvc_dev, self.preset.fps, self.uvc_ctrls)
+        else:
+            uvc.auto_exposure(self.uvc_dev, self.uvc_ctrls)
+
+    def _build_audio_tab(self):
+        from .audio import NoiseRemovalMic, list_microphones
+        self.mic = NoiseRemovalMic()
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Microphone: AI noise removal")
+        gl = QVBoxLayout(g)
+        self.mic_combo = QComboBox()
+        self.mic_combo.addItem("System default input", None)
+        for name, desc in list_microphones():
+            self.mic_combo.addItem(desc, name)
+        i = self.mic_combo.findData(self.cfg.get("mic"))
+        if i >= 0:
+            self.mic_combo.setCurrentIndex(i)
+        gl.addWidget(self.mic_combo)
+        f = QFormLayout()
+        self._slider(f, "Max reduction (dB)", None, 6, 100, 1, "{:.0f}",
+                     value=self.cfg.get("mic_atten", 100), on_change=self._on_atten)
+        gl.addLayout(f)
+        self.mic_btn = QPushButton("Start noise-removal mic")
+        self.mic_btn.setCheckable(True)
+        self.mic_btn.setEnabled(NoiseRemovalMic.available())
+        self.mic_btn.toggled.connect(self._toggle_mic)
+        gl.addWidget(self.mic_btn)
+        gl.addWidget(_hint("DeepFilterNet3 uses a few % of one CPU core. Choose “R9700 Broadcast Mic” as the "
+                           "microphone in Discord / Zoom / OBS."))
+        v.addWidget(g)
+        v.addStretch(1)
+        return w
+
+    def _on_atten(self, x):
+        self.cfg["mic_atten"] = int(x)
+        if getattr(self, "mic_btn", None) is not None and self.mic_btn.isChecked():
+            QTimer.singleShot(400, lambda: self._toggle_mic(True))
+
+    def _toggle_mic(self, on):
+        if on:
+            self.mic.start(self.mic_combo.currentData(), self.cfg.get("mic_atten", 100))
+            self.cfg["mic"] = self.mic_combo.currentData()
+            self.changed()
+        else:
+            self.mic.stop()
+        self.mic_btn.setText("Stop noise-removal mic" if on else "Start noise-removal mic")
+
+    def _build_output_tab(self):
+        import torch
+        from .media import find_loopback
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Virtual cameras")
+        gl = QVBoxLayout(g)
+        gl.addWidget(_hint(
+            "<b>PipeWire camera</b> (recommended): no driver or sudo needed, runs at the preset's full frame rate "
+            "(60/100/120 fps), and carries <b>alpha</b>.<br>OBS Studio: Sources → <i>Video Capture Device "
+            "(PipeWire)</i> → “R9700 Broadcast Camera”. With the <i>Transparent</i> tile, OBS receives you with "
+            "no background and needs no chroma key. Firefox, and Chrome with PipeWire camera enabled, can use it too."))
+        gl.addWidget(_hint(
+            "<b>V4L2 camera</b> (top bar): /dev/video42, YUYV, for apps that only speak V4L2 (Zoom, Discord, "
+            "Teams). " + ("Installed." if find_loopback() else
+                          "Not installed yet: run <tt>sudo scripts/setup-virtualcam.sh</tt> once.")))
+        self.v4a_btn = QPushButton("● V4L2 alpha camera for OBS")
+        self.v4a_btn.setObjectName("live")
+        self.v4a_btn.setCheckable(True)
+        self.v4a_btn.toggled.connect(lambda on: self._set_output("v4l2alpha", on))
+        gl.addWidget(self.v4a_btn)
+        gl.addWidget(_hint(
+            "<b>V4L2 alpha camera</b>: /dev/video43, ABGR32 (B,G,R,<b>A</b>). In OBS use the classic "
+            "<i>Video Capture Device (V4L2)</i> → “R9700 Broadcast Alpha (OBS)”, Video Format "
+            "<b>32-bit ABGR</b>. Same transparency as the PipeWire camera, through OBS's long-standing V4L2 source. "
+            + ("Installed." if find_loopback("R9700 Broadcast Alpha") else "Needs the same one-time setup script.")))
+        v.addWidget(g)
+        g = QGroupBox("Recording")
+        gl = QVBoxLayout(g)
+        self.codec_combo = QComboBox()
+        self.codec_combo.addItem("HEVC (R9700 VCN hardware)", "hevc")
+        self.codec_combo.addItem("H.264 (R9700 VCN hardware)", "h264")
+        self.codec_combo.addItem("ProRes 4444 + alpha (Resolve / Kdenlive)", "prores4444")
+        gl.addWidget(self.codec_combo)
+        f = QFormLayout()
+        self.audio_combo = QComboBox()
+        for k, lab in (("auto", "Auto (AI mic if on)"), ("studio", "AI noise-removed mic"),
+                       ("default", "Default microphone"), ("none", "No sound")):
+            self.audio_combo.addItem(lab, k)
+        self.audio_combo.setCurrentIndex(max(0, self.audio_combo.findData(self.cfg.get("rec_audio", "auto"))))
+        self.audio_combo.activated.connect(lambda _: self._cfg_set("rec_audio", self.audio_combo.currentData()))
+        self.audio_combo.setToolTip("Auto: the R9700 Broadcast Mic (AI noise removal) when it is on, otherwise "
+                                    "your default microphone.")
+        f.addRow("Sound", self.audio_combo)
+        self.audio_sync = QSlider(Qt.Orientation.Horizontal)
+        self.audio_sync.setRange(-200, 200)
+        self.audio_sync.setValue(int(self.cfg.get("rec_audio_adj", 0)))
+        sync_lab = QLabel()
+        def _sync(vv):
+            sync_lab.setText(f"{vv:+d} ms")
+            self._cfg_set("rec_audio_adj", vv)
+        self.audio_sync.valueChanged.connect(_sync)
+        _sync(self.audio_sync.value())
+        row = QHBoxLayout()
+        row.addWidget(self.audio_sync, 1)
+        row.addWidget(sync_lab)
+        f.addRow("Lip-sync trim", row)
+        self.snap_timer = QComboBox()
+        for secs, lab in ((0, "Instant"), (3, "3 s countdown"), (5, "5 s countdown")):
+            self.snap_timer.addItem(lab, secs)
+        self.snap_timer.setCurrentIndex(max(0, self.snap_timer.findData(self.cfg.get("snap_timer", 0))))
+        self.snap_timer.activated.connect(lambda _: self._cfg_set("snap_timer", self.snap_timer.currentData()))
+        f.addRow("Snapshot timer", self.snap_timer)
+        gl.addLayout(f)
+        gl.addWidget(_hint(f"Videos: {RECORD_DIR}. Snapshots and thumbnails: ~/Pictures/R9700 Broadcast. "
+                           "Sound is synced automatically (pipeline latency is compensated); use the trim only if "
+                           "lips look early (−) or late (+). Use ProRes with the Transparent tile to keep alpha."))
+        v.addWidget(g)
+        g = QGroupBox("GPUs")
+        gl = QVBoxLayout(g)
+        self.gpu_checks = []
+        for i in range(self.n_gpus):
+            c = QCheckBox(f"GPU{i}: {torch.cuda.get_device_name(i)}")
+            c.setChecked(f"cuda:{i}" in self.gpus)
+            c.toggled.connect(self._on_gpus)
+            gl.addWidget(c)
+            self.gpu_checks.append(c)
+        gl.addWidget(_hint("Realtime engines use the first ticked GPU. Studio engines split frames across "
+                           "all ticked GPUs."))
+        v.addWidget(g)
+        v.addStretch(1)
+        return w
+
+    def _on_gpus(self, _):
+        self.gpus = [f"cuda:{i}" for i, c in enumerate(self.gpu_checks) if c.isChecked()] or ["cuda:0"]
+        self._apply_engine()
+        self.changed()
+
+    # ---- shutdown ------------------------------------------------------------------------------
+    def closeEvent(self, e):
+        self._save_config()
+        self.mic.stop()
+        self.pipe.stop()
+        if self.provider is not None:
+            self.provider.close()
+        st = self.pipe.studio
+        if st is not None and hasattr(st.engine, "close"):
+            st.engine.close()
+        super().closeEvent(e)
+
+
+def main():
+    os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+    app = QApplication(sys.argv)
+    app.setApplicationName("R9700 Broadcast Studio")
+    app.setDesktopFileName("r9700-broadcast")
+    app.setFont(QFont("Noto Sans", 10))
+    w = Main()
+    w.show()
+    snap = os.environ.get("R9700_BROADCAST_SNAPSHOT")  # "path.png:seconds[:action,...]" - tests/docs
+    if snap:
+        path, secs, *acts = snap.split(":")
+        for i, act in enumerate(",".join(acts).split(",") if acts else []):
+            QTimer.singleShot(int(float(secs) * 400) + 300 * i, lambda a=act: _test_action(w, a))
+        QTimer.singleShot(int(float(secs) * 1000), lambda: (w.grab().save(path), w.close()))
+    sys.exit(app.exec())
+
+
+def _test_action(w: Main, action: str):
+    """Scripted UI actions for headless screenshot tests."""
+    if action.startswith("tile="):
+        name = action[5:].lower()
+        for i in range(w.strip.count()):
+            it = w.strip.item(i)
+            if name in it.text().lower():
+                w.strip.setCurrentItem(it)
+                w._on_tile(it)
+                return
+    elif action == "pipewire":
+        w.pw_btn.setChecked(True)
+    elif action == "v4l2alpha":
+        w.v4a_btn.setChecked(True)
+    elif action == "v4l2":
+        w.v4_btn.setChecked(True)
+    elif action.startswith("import="):
+        w._import(action[7:].split(";"))
+    elif action.startswith("tab="):
+        tabs = w.findChild(QTabWidget)
+        for i in range(tabs.count()):
+            if tabs.tabText(i).lower() == action[4:]:
+                tabs.setCurrentIndex(i)
+    elif action.startswith("bgblur="):
+        w.settings.bg_blur = float(action[7:])

@@ -1,0 +1,13 @@
+.venv/
+models/
+testdata/
+__pycache__/
+*.pyc
+third_party/RobustVideoMatting/
+third_party/deepfilter/*.so
+bin/r9700-pw-camera
+.obs-test/
+third_party/MatAnyone2/
+third_party/sam2/
+.pytest_cache/
+*.npz

@@ -1,0 +1,14 @@
+#!/bin/bash
+# R9700 Broadcast Studio launcher
+HERE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+[ -n "${ROCM_PATH:-}" ] || export ROCM_PATH=/opt/rocm
+export MIOPEN_FIND_MODE=FAST
+export HIP_FORCE_DEV_KERNARG=1
+# NOTE: never enable expandable_segments here - with HIP graphs + ROCm it unmaps memory the GPU
+# is still using when MIOpen retries a workspace allocation (GPU memory fault -> abort).
+export PYTHONWARNINGS=ignore
+# Use the Qt bundled with PyQt6, not a system or desktop-dev plugin path.
+unset QT_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH QT_QPA_PLATFORMTHEME_PATH
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+PY="$HERE/.venv/bin/python"; [ -x "$PY" ] || PY=python3
+exec "$PY" -m r9700_broadcast "$@"
