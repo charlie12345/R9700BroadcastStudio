@@ -48,6 +48,24 @@ def test_fuse_core_fills_interior_hole():
     assert out[..., 510:650, 830:930].min() > 0.9       # hole cannot be seen through
 
 
+def test_fuse_core_motion_widen_is_gated():
+    """A slight luma change (webcam noise, a hand near the face) must not semi-open the widened
+    band: a semi-open envelope paints the confident-but-wrong edge matte (the dark chair wing
+    behind the headset, by the ears) as a translucent fringe. The band widens fully during a real
+    fast move, or stays closed."""
+    H, W = 1080, 1920
+    core = torch.zeros(1, 1, 270, 480, device=DEV)
+    core[..., 60:240, 140:340] = 1                      # subject block (x4 = rows 240..960, cols 560..1360)
+    alpha = torch.zeros(1, 1, H, W, device=DEV)
+    alpha[..., 984:1012, 700:1200] = 0.8                # confident-but-wrong matte just outside the band
+    motion = torch.full((1, 1, 270, 480), 0.11, device=DEV)   # slight change: the fringe regime
+    out = fuse_core(alpha, core, motion, band_px=8.0)
+    assert out[..., 984:1012, 704:1196].max() < 0.03    # no translucent fringe
+    motion = torch.full((1, 1, 270, 480), 1.0, device=DEV)    # a real fast move
+    out = fuse_core(alpha, core, motion, band_px=8.0)
+    assert out[..., 984:1012, 704:1196].max() > 0.6     # still admitted while the subject moves
+
+
 def test_complete_seed_recovers_missing_earcup():
     """SAM 2 often drops a dark ear cup against a dark chair. Mirroring the detected cup across the
     head's centre axis must recover it in the seed, without pulling in anything far from the subject."""

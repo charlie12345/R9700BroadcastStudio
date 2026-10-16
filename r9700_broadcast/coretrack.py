@@ -277,6 +277,34 @@ def _fill_holes(m: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(filled.astype(np.float32)).to(m.device)
 
 
+def _envelope(core: torch.Tensor, motion: torch.Tensor | None, band_px: float, motion_px: float,
+              H: int, W: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The tracker's (hi, lo) envelope at full resolution: a thin band around the tracked core
+    (filled), widened by motion_px where the picture moved."""
+    # the envelope comes from a ~384p matte: build it at 1/2 (720p) or 1/4 (1080p+) resolution and
+    # upsample; only the final clamp runs at full resolution
+    k = 4 if H >= 1000 else 2
+    h2, w2 = H // k, W // k
+    c = F.interpolate(core.float(), size=(h2, w2), mode="bilinear", align_corners=False)
+    c = _fill_holes(c)          # a gap in the tracked core must never punch a see-through hole
+    r = max(1, int(round(band_px * H / 1080 / k)))
+    hi = _maxpool_sep(c, r)
+    lo = -_maxpool_sep(-c, r)
+    if motion is not None:
+        rm = max(r + 1, int(round((band_px + motion_px) * H / 1080 / k)))
+        m = F.interpolate(motion.float(), size=(h2, w2), mode="bilinear", align_corners=False)
+        # widen fully or stay closed: a semi-open band would keep the edge matte at its own value
+        # out there, and a confident-but-wrong matte (the dark chair wing right behind the headset)
+        # shows up as a translucent fringe by the ears. Slight change (webcam noise, a hand near
+        # the face) is below the gate; a real move saturates it.
+        gate = ((m - 0.3) / 0.2).clamp_(0, 1)
+        hi = torch.lerp(hi, _maxpool_sep(c, rm), gate)
+        lo = torch.lerp(lo, -_maxpool_sep(-c, rm), gate)
+    hi = F.interpolate(hi, size=(H, W), mode="bilinear", align_corners=False)
+    lo = F.interpolate(lo, size=(H, W), mode="bilinear", align_corners=False)
+    return hi, lo
+
+
 @torch.no_grad()
 def fuse_core(alpha: torch.Tensor, core: torch.Tensor, motion: torch.Tensor | None = None,
               band_px: float = 8.0, motion_px: float = 48.0) -> torch.Tensor:
@@ -291,26 +319,13 @@ def fuse_core(alpha: torch.Tensor, core: torch.Tensor, motion: torch.Tensor | No
     Deep inside the subject erode(core)=1, so the edge matte cannot turn a headset or temple
     see-through; well outside it dilate(core)=0, so it cannot keep the chair; within r px of the
     tracker's boundary the edge matte's own detail (hair strands, beard) is kept. Where the picture
-    is moving (the tracker is 1-2 frames behind) the band widens by motion_px, so a fast hand or a
-    turning head is never clipped, while static furniture stays strictly outside.
+    is really moving (the tracker is 1-2 frames behind) the band widens by motion_px, so a fast
+    hand or a turning head is never clipped, while static furniture stays strictly outside. The
+    widening is all-or-nothing: a half-open band would show a confident-but-wrong edge matte as a
+    translucent fringe (the dark chair wing right behind the ears).
     """
     H, W = alpha.shape[-2:]
-    # the envelope comes from a ~384p matte: build it at 1/2 (720p) or 1/4 (1080p+) resolution and
-    # upsample; only the final clamp runs at full resolution
-    k = 4 if H >= 1000 else 2
-    h2, w2 = H // k, W // k
-    c = F.interpolate(core.float(), size=(h2, w2), mode="bilinear", align_corners=False)
-    c = _fill_holes(c)          # a gap in the tracked core must never punch a see-through hole
-    r = max(1, int(round(band_px * H / 1080 / k)))
-    hi = _maxpool_sep(c, r)
-    lo = -_maxpool_sep(-c, r)
-    if motion is not None:
-        rm = max(r + 1, int(round((band_px + motion_px) * H / 1080 / k)))
-        m = F.interpolate(motion.float(), size=(h2, w2), mode="bilinear", align_corners=False)
-        hi = torch.lerp(hi, _maxpool_sep(c, rm), m)
-        lo = torch.lerp(lo, -_maxpool_sep(-c, rm), m)
-    hi = F.interpolate(hi, size=(H, W), mode="bilinear", align_corners=False)
-    lo = F.interpolate(lo, size=(H, W), mode="bilinear", align_corners=False)
+    hi, lo = _envelope(core, motion, band_px, motion_px, H, W)
     a = alpha.float()
     return torch.minimum(torch.maximum(a, lo), hi).to(alpha.dtype)
 
