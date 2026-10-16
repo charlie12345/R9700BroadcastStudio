@@ -35,6 +35,43 @@ def available(variant="large") -> bool:
         os.path.isdir(os.path.join(SAM2_DIR, "sam2"))
 
 
+def complete_seed(body, acc):
+    """Complete a seed that misses part of a worn accessory.
+
+    SAM 2 can segment only one ear cup of a headset (a dark cup against a dark chair, or the loose
+    detection box), and the tracker then propagates the missing part as a hole - green showing
+    through the headset. The headset is symmetric, so the missing cup is recovered by mirroring the
+    found accessory across the head's centre axis, keeping only mirrored pixels that sit right next
+    to the known subject. The desk, the wall and the chair wing are therefore never pulled in.
+
+    body, acc: HxW bool (SAM person, SAM accessories). Returns the completed HxW bool seed."""
+    b = np.asarray(body, bool)
+    a = np.asarray(acc, bool)
+    if not b.any() or not a.any():
+        return b | a
+    H, W = b.shape
+    ys, xs = np.nonzero(b)
+    top, bot = int(ys.min()), int(ys.max())
+    # head centre: the top of the body is the skull, which is centred on the face midline. Use just
+    # the top slice so the shoulders/arms do not bias the axis (a one-cup accessory would too).
+    band = b[top:top + max(1, int(0.12 * (bot - top)))]
+    cols = np.nonzero(band.any(0))[0]
+    cx = int(np.median(cols)) if cols.size else int(np.median(xs))
+    head_w = float(cols.max() - cols.min()) if cols.size > 1 else float(xs.max() - xs.min())
+    sx = 2 * cx - np.arange(W)
+    ok = (sx >= 0) & (sx < W)
+    mirror = np.zeros_like(a)
+    mirror[:, ok] = a[:, sx[ok]]
+    # trust mirrored pixels only immediately next to the known subject: a completed ear cup sits
+    # against the head/band, while a stray mirror lands on the chair and is dropped here
+    reach = max(8.0, 0.15 * head_w)
+    dist = cv2.distanceTransform((~(b | a)).astype(np.uint8), cv2.DIST_L2, 5)
+    comp = mirror & (dist <= reach)
+    seed = (b | a | comp).astype(np.uint8)
+    seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    return seed.astype(bool)
+
+
 def grounding_available() -> bool:
     return os.path.isfile(os.path.join(GDINO_DIR, "config.json"))
 

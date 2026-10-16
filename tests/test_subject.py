@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from r9700_broadcast.coretrack import fuse_core, tracker_size
-from r9700_broadcast.seeding import SubjectSeeder
+from r9700_broadcast.seeding import SubjectSeeder, complete_seed
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -33,6 +33,32 @@ def test_fuse_core_envelope():
     assert out[..., 400:800, 800:1100].min() > 0.99     # ghost filled
     assert out[..., 100:200, 100:300].max() < 0.01      # chair gone
     assert 0.3 < out[..., 240, 850].item() < 0.7        # boundary detail kept
+
+
+def test_fuse_core_fills_interior_hole():
+    """A hole in the tracker core (e.g. a see-through ear cup the tracker dropped) must be filled:
+    a subject's interior can never turn transparent just because the core has a gap there."""
+    H, W = 1080, 1920
+    core = torch.zeros(1, 1, 270, 480, device=DEV)
+    core[..., 60:240, 140:340] = 1                      # subject block (x4 = rows 240..960, cols 560..1360)
+    core[..., 120:170, 200:240] = 0                     # hole inside the subject (x4 = rows 480..680, cols 800..960)
+    alpha = torch.zeros(1, 1, H, W, device=DEV)
+    alpha[..., 500:660, 820:940] = 0.1                  # the edge matte says "ghost" in the hole
+    out = fuse_core(alpha, core, band_px=8.0)
+    assert out[..., 510:650, 830:930].min() > 0.9       # hole cannot be seen through
+
+
+def test_complete_seed_recovers_missing_earcup():
+    """SAM 2 often drops a dark ear cup against a dark chair. Mirroring the detected cup across the
+    head's centre axis must recover it in the seed, without pulling in anything far from the subject."""
+    H, W = 400, 600
+    body = np.zeros((H, W), bool)
+    body[100:360, 220:380] = True                       # head/body, centre x ~ 300
+    acc = np.zeros((H, W), bool)
+    acc[150:250, 360:400] = True                        # only the right ear cup was found
+    seed = complete_seed(body, acc)
+    assert seed[150:250, 205:240].mean() > 0.6          # missing left cup (mirrored) recovered
+    assert not seed[0:20, 0:20].any()                   # nothing added far from the subject
 
 
 def test_best_boxes_nms_prefers_confident_tight_box():

@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from .matting import MODELS, ROOT
-
+from .seeding import complete_seed
 MA2_DIR = os.path.join(ROOT, "third_party", "MatAnyone2")
 MA2_WEIGHTS = os.path.join(MODELS, "matanyone2", "matanyone2.pth")
 DEEPLAB_WEIGHTS = os.path.join(MODELS, "torchvision", "deeplabv3_mobilenet_v3_large-fc3c493d.pth")
@@ -135,6 +135,7 @@ class CoreTracker:
             m = self.seeder(rgb, person[0, 0].float().cpu().numpy(), chair[0, 0].float().cpu().numpy())
             if m is None:
                 return None
+            m = complete_seed(self.seeder.last_body, self.seeder.last_accessories)
             return torch.from_numpy(m.astype(np.float32)).to(self.device)[None, None]
         # fallback without SAM 2: semantic person, sharpened by the edge matte, minus the chair
         m = (person > 0.5).float()
@@ -260,6 +261,22 @@ def _maxpool_sep(x: torch.Tensor, r: int) -> torch.Tensor:
     return F.max_pool2d(x, (1, 2 * r + 1), 1, (0, r))
 
 
+def _fill_holes(m: torch.Tensor) -> torch.Tensor:
+    """Fill background fully enclosed by the mask (a hole in the tracker's subject). This is an
+    exact, connectivity-aware flood from the frame border: a naive GPU max-pool flood jumps thin
+    barriers, which would fuse a hole to the outside and leave it transparent. The subject's outer
+    boundary is untouched, so boundary detail (ears, hair) is preserved."""
+    from scipy import ndimage
+    hard = (m > 0.5)
+    arr = hard.detach().cpu().numpy()
+    filled = np.empty_like(arr)
+    it = np.nditer(arr[..., 0, 0], flags=["multi_index"])
+    for _ in it:
+        b, c = it.multi_index
+        filled[b, c] = ndimage.binary_fill_holes(arr[b, c])
+    return torch.from_numpy(filled.astype(np.float32)).to(m.device)
+
+
 @torch.no_grad()
 def fuse_core(alpha: torch.Tensor, core: torch.Tensor, motion: torch.Tensor | None = None,
               band_px: float = 8.0, motion_px: float = 48.0) -> torch.Tensor:
@@ -283,6 +300,7 @@ def fuse_core(alpha: torch.Tensor, core: torch.Tensor, motion: torch.Tensor | No
     k = 4 if H >= 1000 else 2
     h2, w2 = H // k, W // k
     c = F.interpolate(core.float(), size=(h2, w2), mode="bilinear", align_corners=False)
+    c = _fill_holes(c)          # a gap in the tracked core must never punch a see-through hole
     r = max(1, int(round(band_px * H / 1080 / k)))
     hi = _maxpool_sep(c, r)
     lo = -_maxpool_sep(-c, r)
