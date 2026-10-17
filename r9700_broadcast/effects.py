@@ -6,10 +6,13 @@ auto-frame bounding box (4 numbers per frame).
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
+
+from .props import draw_props
 
 CHROMA_GREEN = (0.0, 177 / 255, 64 / 255)   # broadcast chroma green
 CHROMA_BLUE = (0.0, 71 / 255, 187 / 255)
@@ -58,6 +61,9 @@ class Settings:
     subject_lock: bool = True       # MatAnyone 2 core tracker (Grounded-SAM 2 seeded) fused with RVM
     keep_accessories: bool = True   # semantic guard: headphones / mic / glasses stay solid
     chair: str = "auto"             # auto | remove | keep
+    # fun props (face-tracked comical overlays)
+    fun_props: list = field(default_factory=list)  # any of props.PROPS, e.g. ["santa_hat"]
+    bubble_text: str = "HELLO!"    # speech bubble caption
     extra: dict = field(default_factory=dict)
 
 
@@ -291,7 +297,7 @@ class Compositor:
 
     @torch.no_grad()
     def __call__(self, src: torch.Tensor, alpha: torch.Tensor | None, fgr: torch.Tensor | None,
-                 s: Settings) -> torch.Tensor:
+                 s: Settings, face=None) -> torch.Tensor:
         H, W = src.shape[-2:]
         scale = H / 1080.0
         self.out_alpha = None
@@ -354,6 +360,11 @@ class Compositor:
             if s.vignette > 0 and s.mode not in ("matte", "transparent"):
                 _, radial = self._grid(H, W, src.device)
                 out = out * (1 - s.vignette * radial)
+
+            if face is not None and s.fun_props:
+                # face-tracked props ride the composited frame (pre crop/mirror so they stay
+                # glued to the face through those transforms)
+                out = draw_props(out, face, s.fun_props, time.perf_counter(), s.bubble_text)
 
             if s.auto_frame:
                 box = self.framer.update(a, s.frame_zoom, s.frame_speed)

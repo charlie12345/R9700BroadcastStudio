@@ -11,8 +11,8 @@ import numpy as np
 from PyQt6.QtCore import QObject, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog,
-                             QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QListView,
-                             QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton,
+                             QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                             QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton,
                              QScrollArea, QSizePolicy, QSlider, QTabWidget, QVBoxLayout, QWidget)
 
 from . import backgrounds as B
@@ -237,6 +237,7 @@ class Main(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._scroll(self._build_bg_tab()), "Background")
         tabs.addTab(self._scroll(self._build_subject_tab()), "Subject")
+        tabs.addTab(self._scroll(self._build_fun_tab()), "Fun")
         tabs.addTab(self._scroll(self._build_camera_tab()), "Camera")
         tabs.addTab(self._scroll(self._build_audio_tab()), "Audio")
         tabs.addTab(self._scroll(self._build_output_tab()), "Output")
@@ -881,6 +882,42 @@ class Main(QMainWindow):
                 self.plate_btn.setText("Captured ✓ - re-capture")
                 self.pipe.command(lambda p: p.studio and p.studio.start_plate_capture())
         tick()
+
+    def _build_fun_tab(self):
+        from .props import LABELS, PROPS
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Fun props (face-tracked)")
+        gl = QVBoxLayout(g)
+        gl.addWidget(_hint("Comical overlays that ride your face. Pupils wobble, the propeller spins, "
+                           "the bulb pulses and the bubble bobs. Props hide when the face tracker loses "
+                           "you (sharp profile turns) instead of guessing."))
+        for name in PROPS:
+            c = QCheckBox(LABELS[name])
+            c.setChecked(name in self.settings.fun_props)
+            c.toggled.connect(lambda v, n=name: self._on_prop(n, v))
+            gl.addWidget(c)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Speech bubble text"))
+        self.bubble_edit = QLineEdit(self.settings.bubble_text)
+        self.bubble_edit.setMaxLength(40)
+        self.bubble_edit.editingFinished.connect(self._on_bubble_text)
+        row.addWidget(self.bubble_edit, 1)
+        gl.addLayout(row)
+        v.addWidget(g)
+        v.addStretch(1)
+        return w
+
+    def _on_prop(self, name, on):
+        props = [p for p in self.settings.fun_props if p != name]
+        if on:
+            props.append(name)
+        self.settings.fun_props = props
+        self.changed()
+
+    def _on_bubble_text(self):
+        self.settings.bubble_text = self.bubble_edit.text().strip() or "HELLO!"
+        self.changed()
 
     def _build_camera_tab(self):
         w = QWidget()

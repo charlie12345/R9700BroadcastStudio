@@ -17,6 +17,7 @@ you must follow that component's license.
 | **Grounding DINO** (base), IDEA Research | finding headphones / headset / microphone by name (optional) | Apache-2.0 | https://huggingface.co/IDEA-Research/grounding-dino-base |
 | **MatAnyone 2**, Yang et al., S-Lab NTU | subject-lock tracker (optional) | **NTU S-Lab License 1.0, non-commercial only** | https://github.com/pq-yang/MatAnyone2 |
 | **DeepFilterNet** LADSPA plugin, Schröter et al. | noise-removal microphone | MIT / Apache-2.0 | https://github.com/Rikorose/DeepFilterNet |
+| **BlazeFace short-range**, Google AI Edge | face box + eye/nose keypoints for fun props | Apache-2.0 | https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector |
 
 ### Important license consequences
 
@@ -30,7 +31,7 @@ you must follow that component's license.
 ## System software used at runtime (not distributed)
 
 PyTorch (BSD-3-Clause), ROCm (mostly MIT), OpenCV (Apache-2.0), PyQt6 / Qt (GPL-3.0 / commercial;
-PyQt6 is GPL-3.0), NumPy (BSD-3-Clause), Hugging Face Transformers (Apache-2.0), OmegaConf / Hydra
+PyQt6 is GPL-3.0), NumPy (BSD-3-Clause), MediaPipe Tasks (Apache-2.0), Hugging Face Transformers (Apache-2.0), OmegaConf / Hydra
 (BSD-3-Clause / MIT), FFmpeg (LGPL/GPL), PipeWire (MIT), v4l2loopback (GPL-2.0, optional).
 
 Note: PyQt6 is GPL-3.0. Like RVM, it is installed separately; a binary distribution that bundles
