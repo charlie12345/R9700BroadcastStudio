@@ -111,6 +111,7 @@ class LivePipeline:
                 if p.studio:
                     p.studio.engine.reset()
                     p.studio.compositor.framer.reset()
+                    p.studio.compositor.cameo.reset()
         self.command(do)
 
     def add_output(self, name, sink):

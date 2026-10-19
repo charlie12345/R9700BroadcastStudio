@@ -163,12 +163,15 @@ class Studio:
         for mode in MODES:
             for extra in ({}, {"auto_frame": True, "feather": 2.0, "choke": 1.0, "vignette": 0.3,
                               "relight": 0.3, "denoise": 0.3, "bg_blur": 0.5, "mirror": True},
-                          {"choke": -1.0, "feather": 6.0}):
+                          {"choke": -1.0, "feather": 6.0},
+                          {"layout": "cameo", "cameo_pop": True, "cameo_ring": "rainbow", "mirror": True},
+                          {"layout": "cameo", "cameo_shape": "cutout", "cameo_fill": "camera"}):
                 self.compositor(src, a, src, replace(self.settings, mode=mode, **extra))
         self.plate.difference(src, F.avg_pool2d(a.float(), self.plate.LO)) if self.plate.ready else None
         torch.cuda.synchronize(self.device)
         self.compositor.framer = saved_framer
         self.compositor.denoiser.reset()
+        self.compositor.cameo.reset()
 
     def process_tensor(self, src: torch.Tensor):
         """Returns (composited, alpha, fgr, src_used) tensors on GPU."""

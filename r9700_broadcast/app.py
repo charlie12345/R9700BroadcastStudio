@@ -4,20 +4,23 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import asdict
 
 import numpy as np
-from PyQt6.QtCore import QObject, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPixmap
+from PyQt6.QtCore import QObject, QPointF, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog,
                              QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                              QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton,
                              QScrollArea, QSizePolicy, QSlider, QTabWidget, QVBoxLayout, QWidget)
 
 from . import backgrounds as B
+from . import screencap
 from . import uvc
-from .effects import Settings
+from .effects import (CAMEO_FILLS, CAMEO_RINGS, CAMEO_SHAPES, Settings, cameo_center,
+                      cameo_from_point)
 from .matting import ENGINES
 from .pipeline import PRESET_BY_KEY, PRESETS, LivePipeline
 
@@ -40,7 +43,7 @@ QSlider::groove:horizontal {{ height: 4px; background: #32353f; border-radius: 2
 QSlider::handle:horizontal {{ background: {ACCENT}; width: 14px; margin: -6px 0; border-radius: 7px; }}
 QSlider::sub-page:horizontal {{ background: #a01c2c; border-radius: 2px; }}
 QTabWidget::pane {{ border: 1px solid #2a2d36; border-radius: 8px; top: -1px; }}
-QTabBar::tab {{ background: #181a20; padding: 7px 12px; border-top-left-radius: 6px; border-top-right-radius: 6px; }}
+QTabBar::tab {{ background: #181a20; padding: 7px 8px; border-top-left-radius: 6px; border-top-right-radius: 6px; }}
 QTabBar::tab:selected {{ background: #262932; color: white; }}
 QListWidget {{ background: transparent; border: none; }}
 QListWidget::item {{ border-radius: 8px; padding: 4px; color: #c9cad3; }}
@@ -56,6 +59,7 @@ QScrollArea {{ border: none; }}
 SPECIAL_TILES = [
     ("off", "Camera", "No effect"),
     ("blur", "Blur", "Blur the real background"),
+    ("screen", "Screen share", "Your screen or a window as the background - you stay on top of it"),
     ("green", "Green screen", "Chroma green for OBS / vMix keying"),
     ("blue", "Blue screen", "Chroma blue"),
     ("transparent", "Transparent", "Real alpha via the PipeWire camera (OBS Studio)"),
@@ -96,6 +100,15 @@ def _tile_pixmap(kind: str, w=192, h=108, color=(0.12, 0.12, 0.14)) -> QPixmap:
                 p.fillRect(x, y, 12, 12, QColor("#cfd0d6") if (x + y) // 12 % 2 else QColor("#8d8f99"))
     elif kind == "matte":
         pm.fill(QColor("black"))
+    elif kind == "screen":
+        pm.fill(QColor("#e9ebf0"))
+        p.fillRect(0, 0, w, 14, QColor("#343843"))
+        p.setPen(QPen(QColor("#9da2b0"), 4))
+        for i, ln in enumerate((0.7, 0.55, 0.8, 0.45, 0.62)):
+            p.drawLine(12, 26 + i * 15, 12 + int((w - 24) * ln), 26 + i * 15)
+        p.setPen(QPen(QColor(ACCENT), 3))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(18, 34, 70, 26)                    # an annotation circle
     elif kind == "blur":
         p.setPen(Qt.PenStyle.NoPen)
         for i in range(12):
@@ -149,9 +162,72 @@ class PreviewView(QWidget):
         cp.fillRect(16, 16, 16, 16, QColor("#cfd0d6"))
         cp.end()
 
+        self.settings: Settings | None = None   # set by Main: the cameo bubble is dragged here
+        self.on_cameo_moved = None
+        self.on_cameo_resized = None
+        self._r = QRect()
+        self._drag = None                        # grab offset (image px) while dragging the bubble
+        self._hover = False
+        self.setMouseTracking(True)
+
     def set_frame(self, img: QImage, alpha: bool):
         self.img, self.alpha, self.message = img, alpha, ""
         self.update()
+
+    # -- cameo bubble: drag to move, scroll to resize ---------------------------------------------
+    def _to_img(self, pos):
+        if self.img is None or self._r.width() <= 0:
+            return None
+        k = self.img.width() / self._r.width()
+        return (pos.x() - self._r.x()) * k, (pos.y() - self._r.y()) * k
+
+    def _cameo_hit(self, pt):
+        s = self.settings
+        if s is None or s.layout != "cameo" or self.img is None or pt is None:
+            return False
+        cx, cy, D = cameo_center(s, self.img.height(), self.img.width())
+        r = D / 2 * 1.08
+        if s.cameo_shape == "circle":
+            return (pt[0] - cx) ** 2 + (pt[1] - cy) ** 2 <= r * r
+        return abs(pt[0] - cx) <= r and abs(pt[1] - cy) <= r
+
+    def mousePressEvent(self, e):
+        pt = self._to_img(e.position())
+        if e.button() == Qt.MouseButton.LeftButton and self._cameo_hit(pt):
+            cx, cy, _ = cameo_center(self.settings, self.img.height(), self.img.width())
+            self._drag = (pt[0] - cx, pt[1] - cy)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.update()
+
+    def mouseMoveEvent(self, e):
+        pt = self._to_img(e.position())
+        if self._drag is not None and pt is not None:
+            s = self.settings
+            s.cameo_x, s.cameo_y = cameo_from_point(s, self.img.height(), self.img.width(),
+                                                    pt[0] - self._drag[0], pt[1] - self._drag[1])
+            self.update()
+            return
+        hover = self._cameo_hit(pt)
+        if hover != self._hover:
+            self._hover = hover
+            self.setCursor(Qt.CursorShape.OpenHandCursor if hover else Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self._drag is not None:
+            self._drag = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor if self._hover else Qt.CursorShape.ArrowCursor)
+            if self.on_cameo_moved:
+                self.on_cameo_moved()
+            self.update()
+
+    def wheelEvent(self, e):
+        if self._cameo_hit(self._to_img(e.position())) and self.on_cameo_resized:
+            steps = e.angleDelta().y() / 120
+            self.on_cameo_resized(min(0.9, max(0.12, self.settings.cameo_size * 1.06 ** steps)))
+            e.accept()
+            return
+        super().wheelEvent(e)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -162,10 +238,23 @@ class PreviewView(QWidget):
             return
         sz = self.img.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
         r = QRect((self.width() - sz.width()) // 2, (self.height() - sz.height()) // 2, sz.width(), sz.height())
+        self._r = r
         if self.alpha:
             p.drawTiledPixmap(r, self._checker)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.drawImage(r, self.img)
+        s = self.settings
+        if s is not None and s.layout == "cameo" and (self._hover or self._drag is not None):
+            # outline where the bubble is (drawn at the live drag position, not the last frame's)
+            k = r.width() / self.img.width()
+            cx, cy, D = cameo_center(s, self.img.height(), self.img.width())
+            box = QRectF(r.x() + (cx - D / 2) * k, r.y() + (cy - D / 2) * k, D * k, D * k)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(QPen(QColor(ACCENT), 2, Qt.PenStyle.DashLine))
+            if s.cameo_shape == "circle":
+                p.drawEllipse(box)
+            else:
+                p.drawRect(box)
 
 
 class Bridge(QObject):
@@ -175,6 +264,7 @@ class Bridge(QObject):
     snapshot = pyqtSignal(object, bool)
     error = pyqtSignal(str)
     uncheck = pyqtSignal(str)
+    screen = pyqtSignal(object, str, str)     # (ScreenShare | None, kind, error)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -205,6 +295,7 @@ class Main(QMainWindow):
             self.engine = self.preset.engine
         self.want = {"pipewire": False, "v4l2": False, "v4l2alpha": False}
         self.provider = None
+        self.screen_busy = False
         self.uvc_ctrls = {}
         self.uvc_dev = None
 
@@ -214,6 +305,7 @@ class Main(QMainWindow):
         self.bridge.lock.connect(self._on_lock_status)
         self.bridge.snapshot.connect(self._on_snapshot)
         self.bridge.error.connect(self._on_error)
+        self.bridge.screen.connect(self._on_screen)
         self.bridge.uncheck.connect(lambda n: {"pipewire": self.pw_btn, "v4l2": self.v4_btn,
                                                "v4l2alpha": self.v4a_btn}[n].setChecked(False))
         self.pipe = LivePipeline(None, on_preview=self._emit_preview, on_status=self._emit_status,
@@ -224,6 +316,9 @@ class Main(QMainWindow):
         left = QVBoxLayout()
         left.addWidget(self._build_topbar())
         self.view = PreviewView()
+        self.view.settings = self.settings
+        self.view.on_cameo_moved = self.changed
+        self.view.on_cameo_resized = lambda x: self.cameo_size_slider.set_value(x)
         left.addWidget(self.view, 1)
         self.status = QLabel("")
         self.status.setObjectName("status")
@@ -236,6 +331,7 @@ class Main(QMainWindow):
         outer.addLayout(left, 1)
         tabs = QTabWidget()
         tabs.addTab(self._scroll(self._build_bg_tab()), "Background")
+        tabs.addTab(self._scroll(self._build_layout_tab()), "Layout")
         tabs.addTab(self._scroll(self._build_subject_tab()), "Subject")
         tabs.addTab(self._scroll(self._build_fun_tab()), "Fun")
         tabs.addTab(self._scroll(self._build_camera_tab()), "Camera")
@@ -256,7 +352,10 @@ class Main(QMainWindow):
         self._apply_engine()
         self._apply_source()
         bg = self.cfg.get("background")
-        if bg and os.path.exists(bg):
+        if bg == "screen":
+            if self.settings.mode == "replace":   # resume the share (no picker: restore token)
+                self._start_screen(self.cfg.get("screen_kind", "monitor"))
+        elif bg and os.path.exists(bg):
             self._set_background(bg, switch_mode=False)
         self._select_mode_tile(self.settings.mode)
 
@@ -627,7 +726,12 @@ class Main(QMainWindow):
 
     def _on_tile(self, it):
         d = it.data(Qt.ItemDataRole.UserRole)
-        if d[0] == "mode":
+        if d == ("mode", "screen"):
+            if isinstance(self.provider, screencap.ScreenBackground):
+                self._set_mode("replace")
+            else:
+                self._start_screen(self.cfg.get("screen_kind", "monitor"))
+        elif d[0] == "mode":
             self._set_mode(d[1])
             if d[1] == "transparent" and not (self.pw_btn.isChecked() or self.v4a_btn.isChecked()):
                 self._on_error("Transparent output needs an alpha-capable output: “● PipeWire camera” "
@@ -653,8 +757,10 @@ class Main(QMainWindow):
     def _select_mode_tile(self, mode):
         for i in range(self.strip.count()):
             d = self.strip.item(i).data(Qt.ItemDataRole.UserRole)
+            bg = self.cfg.get("background")
             if (mode != "replace" and d[0] == "mode" and d[1] == mode) or \
-               (mode == "replace" and d[0] == "bg" and d[1] == self.cfg.get("background")):
+               (mode == "replace" and bg == "screen" and d == ("mode", "screen")) or \
+               (mode == "replace" and d[0] == "bg" and d[1] == bg):
                 self.strip.setCurrentRow(i)
                 return
 
@@ -669,19 +775,87 @@ class Main(QMainWindow):
         except Exception as e:  # noqa: BLE001
             self._on_error(f"Can't use {os.path.basename(path)}: {e}")
             return
+        self._use_provider(prov, path, switch_mode)
+
+    def _use_provider(self, prov, key, switch_mode=True):
         old, self.provider = self.provider, prov
 
         def do(p):
             if p.studio is not None:
                 p.studio.compositor.background_src = prov
             if old is not None:
-                old.close()
+                old.close()      # also ends a screen share that is being replaced
         self.pipe.command(do)
-        self.cfg["background"] = path
+        self.cfg["background"] = key
         if switch_mode:
             self.settings.mode = "replace"
         self._select_mode_tile(self.settings.mode)
+        self._sync_screen_ui()
         self.changed()
+
+    # ---- screen share ----------------------------------------------------------------------------
+    def _start_screen(self, kind="monitor", pick=False):
+        """Share a monitor/window as the background. pick=True always shows the desktop's picker;
+        otherwise the last choice is restored silently where the desktop supports it."""
+        if self.screen_busy:
+            return
+        backend = screencap.backend_name()
+        if backend is None:
+            self._on_error(screencap.missing_reason())
+            return
+        geometry = None
+        if backend != "portal":
+            scr = QGuiApplication.screens()
+            i = min(max(0, self.screen_combo.currentIndex()), len(scr) - 1)
+            g, k = scr[i].geometry(), scr[i].devicePixelRatio()
+            geometry = (int(g.x() * k), int(g.y() * k), int(g.width() * k), int(g.height() * k))
+        token = None if pick else (self.cfg.get("screen_tokens") or {}).get(kind)
+        self.screen_busy = True
+        self.screen_status.setText("Pick what to share in your desktop's dialog…" if backend == "portal"
+                                   else "Starting screen capture…")
+
+        def run():
+            try:
+                share = screencap.start_share(kind, token, geometry, on_end=self.bridge.error.emit)
+                self.bridge.screen.emit(share, kind, "")
+            except screencap.PortalCancelled:
+                self.bridge.screen.emit(None, kind, "")
+            except Exception as e:  # noqa: BLE001
+                self.bridge.screen.emit(None, kind, str(e))
+        threading.Thread(target=run, name="r9700-screen-pick", daemon=True).start()
+
+    def _on_screen(self, share, kind, err):
+        self.screen_busy = False
+        if share is None:
+            if err:
+                self._on_error(f"Screen share: {err}")
+            self._sync_screen_ui()
+            return
+        if share.restore_token:
+            self.cfg.setdefault("screen_tokens", {})[kind] = share.restore_token
+        self.cfg["screen_kind"] = kind
+        self._use_provider(screencap.ScreenBackground(share), "screen")
+
+    def _stop_screen(self):
+        if not isinstance(self.provider, screencap.ScreenBackground):
+            return
+        fallback = next((p for p, _ in self.library.items()), None)
+        if fallback:
+            self._set_background(fallback, switch_mode=self.settings.mode == "replace")
+        else:
+            self._use_provider(None, None, switch_mode=False)
+            self._set_mode("blur")
+
+    def _sync_screen_ui(self):
+        if not hasattr(self, "screen_status"):
+            return
+        prov = self.provider
+        on = isinstance(prov, screencap.ScreenBackground)
+        self.screen_stop.setEnabled(on)
+        if on:
+            self.screen_status.setText(f"Sharing: {prov.share.label}")
+        elif not self.screen_busy:
+            self.screen_status.setText("Not sharing")
 
     def add_backgrounds(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Add backgrounds", os.path.expanduser("~/Pictures"),
@@ -713,6 +887,7 @@ class Main(QMainWindow):
     def _build_bg_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
+        v.addWidget(self._build_screen_group())
         g = QGroupBox("Background blur")
         gl = QVBoxLayout(g)
         row = QHBoxLayout()
@@ -757,6 +932,97 @@ class Main(QMainWindow):
         v.addWidget(g)
         v.addStretch(1)
         return w
+
+    def _build_screen_group(self):
+        g = QGroupBox("Screen share background")
+        gl = QVBoxLayout(g)
+        backend = screencap.backend_name()
+        row = QHBoxLayout()
+        b = QPushButton("Share a screen…")
+        b.clicked.connect(lambda: self._start_screen("monitor", pick=True))
+        row.addWidget(b)
+        if screencap.can_share_windows():
+            b = QPushButton("Share a window…")
+            b.clicked.connect(lambda: self._start_screen("window", pick=True))
+            row.addWidget(b)
+        self.screen_stop = QPushButton("Stop")
+        self.screen_stop.clicked.connect(self._stop_screen)
+        row.addWidget(self.screen_stop)
+        gl.addLayout(row)
+        self.screen_combo = QComboBox()
+        if backend in ("x11", "gdi"):      # no desktop picker there: choose the monitor here
+            for i, scr in enumerate(QGuiApplication.screens()):
+                gm = scr.geometry()
+                self.screen_combo.addItem(f"{i + 1}: {scr.name()} {gm.width()}x{gm.height()}")
+            gl.addWidget(self.screen_combo)
+        self.screen_status = QLabel("Not sharing")
+        gl.addWidget(self.screen_status)
+        if backend is None:
+            gl.addWidget(_hint(screencap.missing_reason()))
+        else:
+            gl.addWidget(_hint("Shows your screen behind you. Your desktop asks what to share the first "
+                               "time and remembers it. For a smaller you, try the bubble in the Layout tab."))
+        self._sync_screen_ui()
+        return g
+
+    def _build_layout_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("You on screen")
+        f = QFormLayout(g)
+        lay = QComboBox()
+        lay.addItem("Full size - you over the background", "full")
+        lay.addItem("Bubble - you in a circle / box", "cameo")
+        lay.setCurrentIndex(max(0, lay.findData(self.settings.layout)))
+        self.layout_combo = lay
+
+        def on_layout(_):
+            self.settings.layout = lay.currentData()
+            if self.settings.layout == "cameo":    # starts in the lower-right corner
+                self.settings.cameo_x = self.settings.cameo_y = 1.0
+            self.changed()
+        lay.activated.connect(on_layout)
+        f.addRow("Layout", lay)
+
+        def combo(label, attr, items):
+            c = QComboBox()
+            for k, lab in items.items():
+                c.addItem(lab, k)
+            c.setCurrentIndex(max(0, c.findData(getattr(self.settings, attr))))
+            c.activated.connect(lambda _: (setattr(self.settings, attr, c.currentData()), self.changed()))
+            f.addRow(label, c)
+            return c
+        combo("Shape", "cameo_shape", CAMEO_SHAPES)
+        self.cameo_size_slider = self._slider(f, "Size", "cameo_size", 0.12, 0.9, 0.01)
+        self._slider(f, "Zoom", "cameo_zoom", 0.6, 2.5, 0.05)
+        combo("Behind you", "cameo_fill", CAMEO_FILLS)
+        combo("Ring", "cameo_ring", {k: k.capitalize() if k != "none" else "No ring" for k in CAMEO_RINGS})
+        self._slider(f, "Ring width", "cameo_border", 0, 24, 1, fmt="{:.0f} px")
+        box = QVBoxLayout()
+        self._check(box, "Follow my head", "cameo_follow")
+        self._check(box, "Pop out of the frame (head breaks over the top)", "cameo_pop")
+        self._check(box, "Drop shadow", "cameo_shadow")
+        f.addRow(box)
+        row = QHBoxLayout()
+        for lab, x, y in (("↖", 0, 0), ("↗", 1, 0), ("Centre", 0.5, 0.5), ("↙", 0, 1), ("↘", 1, 1)):
+            b = QPushButton(lab)
+            b.setToolTip("Move the bubble here")
+            b.clicked.connect(lambda _=None, x=x, y=y: self._place_cameo(x, y))
+            row.addWidget(b)
+        f.addRow("Place", row)
+        f.addRow(_hint("Drag the bubble in the preview to move it, scroll over it to resize. It works "
+                       "over every background: screen share, pictures, videos, blur, green screen and "
+                       "transparent (OBS)."))
+        v.addWidget(g)
+        v.addStretch(1)
+        return w
+
+    def _place_cameo(self, x, y):
+        if self.settings.layout != "cameo":
+            self.settings.layout = "cameo"
+            self.layout_combo.setCurrentIndex(self.layout_combo.findData("cameo"))
+        self.settings.cameo_x, self.settings.cameo_y = x, y
+        self.changed()
 
     def _pick_color(self):
         c = QColorDialog.getColor(QColor.fromRgbF(*self.settings.bg_color), self, "Background colour")
@@ -1183,5 +1449,11 @@ def _test_action(w: Main, action: str):
         for i in range(tabs.count()):
             if tabs.tabText(i).lower() == action[4:]:
                 tabs.setCurrentIndex(i)
+    elif action.startswith("layout="):
+        w.layout_combo.setCurrentIndex(w.layout_combo.findData(action[7:]))
+        w.layout_combo.activated.emit(w.layout_combo.currentIndex())
+    elif action.startswith("cameo="):          # cameo=x,y
+        x, y = (float(t) for t in action[6:].split(";"))
+        w._place_cameo(x, y)
     elif action.startswith("bgblur="):
         w.settings.bg_blur = float(action[7:])

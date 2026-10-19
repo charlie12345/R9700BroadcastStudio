@@ -55,6 +55,13 @@ class Face:
         return Face((x * sx, y * sy, w * sx, h * sy), f(self.leye), f(self.reye),
                     f(self.nose), f(self.mouth), self.score)
 
+    def mirrored(self, width):
+        """The same face in a horizontally flipped frame of this width."""
+        (x, y, w, h) = self.box
+        f = lambda p: (width - p[0], p[1])
+        return Face((width - x - w, y, w, h), f(self.reye), f(self.leye), f(self.nose), f(self.mouth),
+                    self.score)
+
 
 def _ema_face(prev: Face | None, new: Face, a: float) -> Face:
     if prev is None:
@@ -181,7 +188,8 @@ def anchors(face: Face) -> dict:
 
 
 def stamp(out: torch.Tensor, sprite_rgba: np.ndarray, cx: float, cy: float, device) -> None:
-    """Alpha-composite an RGBA sprite centred at (cx, cy) onto a (1,3,H,W) float frame."""
+    """Alpha-composite an RGBA sprite centred at (cx, cy) onto a (1,3,H,W) float frame, or onto a
+    (1,4,H,W) RGBA layer (straight colour), whose alpha then grows to cover the sprite."""
     sh, sw = sprite_rgba.shape[:2]
     H, W = out.shape[-2:]
     x0, y0 = int(round(cx - sw / 2)), int(round(cy - sh / 2))
@@ -191,8 +199,11 @@ def stamp(out: torch.Tensor, sprite_rgba: np.ndarray, cx: float, cy: float, devi
         return
     sp = torch.from_numpy(sprite_rgba[dy0:dy1, dx0:dx1].astype(np.float32) / 255).to(device)
     rgb, a = sp[..., :3].permute(2, 0, 1), sp[..., 3:4].permute(2, 0, 1)
-    tgt = out[0, :, y0 + dy0:y0 + dy1, x0 + dx0:x0 + dx1]
+    tgt = out[0, :3, y0 + dy0:y0 + dy1, x0 + dx0:x0 + dx1]
     tgt.mul_(1 - a).add_(rgb * a)
+    if out.shape[1] == 4:
+        ta = out[0, 3:4, y0 + dy0:y0 + dy1, x0 + dx0:x0 + dx1]
+        ta.mul_(1 - a).add_(a)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -328,7 +339,8 @@ def _blades_sprite(s: int, step: int, steps: int = 8) -> np.ndarray:
 
 def draw_props(out: torch.Tensor, face: Face | None, props, t: float,
                bubble_text: str = "HELLO!") -> torch.Tensor:
-    """Composite the enabled props onto a (1,3,H,W) float frame (no-op without a face)."""
+    """Composite the enabled props onto a (1,3,H,W) float frame or (1,4,H,W) RGBA layer
+    (no-op without a face)."""
     if face is None or not props:
         return out
     dev = str(out.device)

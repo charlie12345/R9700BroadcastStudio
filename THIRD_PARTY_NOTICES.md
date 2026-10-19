@@ -32,7 +32,8 @@ you must follow that component's license.
 
 PyTorch (BSD-3-Clause), ROCm (mostly MIT), OpenCV (Apache-2.0), PyQt6 / Qt (GPL-3.0 / commercial;
 PyQt6 is GPL-3.0), NumPy (BSD-3-Clause), MediaPipe Tasks (Apache-2.0), Hugging Face Transformers (Apache-2.0), OmegaConf / Hydra
-(BSD-3-Clause / MIT), FFmpeg (LGPL/GPL), PipeWire (MIT), v4l2loopback (GPL-2.0, optional).
+(BSD-3-Clause / MIT), FFmpeg (LGPL/GPL), PipeWire (MIT), GStreamer (LGPL-2.1, screen share),
+jeepney (MIT, screen share), xdg-desktop-portal (LGPL-2.1, part of the desktop), v4l2loopback (GPL-2.0, optional).
 
 Note: PyQt6 is GPL-3.0. Like RVM, it is installed separately; a binary distribution that bundles
 PyQt6 must follow its license.
