@@ -46,7 +46,8 @@ fi
 lspci 2>/dev/null | grep -iE 'vga|display' | grep -i amd || echo "(lspci found no AMD display device; continuing)"
 
 if [ $SYS = 1 ] && command -v apt-get >/dev/null; then
-  PKGS=(python3-venv python3-dev ffmpeg pipewire-bin build-essential pkg-config libpipewire-0.3-dev git curl)
+  PKGS=(python3-venv python3-dev ffmpeg pipewire-bin build-essential pkg-config libpipewire-0.3-dev git curl
+        gstreamer1.0-tools gstreamer1.0-pipewire gstreamer1.0-plugins-base)
   MISSING=()
   for p in "${PKGS[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || MISSING+=("$p"); done
   if [ ${#MISSING[@]} -gt 0 ]; then
@@ -55,7 +56,8 @@ if [ $SYS = 1 ] && command -v apt-get >/dev/null; then
   fi
 elif [ $SYS = 1 ]; then
   echo "Not a Debian/Ubuntu system: install python3 (3.10+, with venv), ffmpeg, pipewire tools (pw-record),"
-  echo "a C compiler, pkg-config, the PipeWire development headers, git and curl yourself."
+  echo "a C compiler, pkg-config, the PipeWire development headers, git, curl and GStreamer with its"
+  echo "PipeWire plugin (gst-launch-1.0 + pipewiresrc, for screen share) yourself."
 fi
 for c in ffmpeg pw-record git curl cc pkg-config; do command -v $c >/dev/null || die "'$c' not found (see above)."; done
 

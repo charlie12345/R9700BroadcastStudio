@@ -34,7 +34,10 @@ class Studio:
         self.settings = settings or Settings()
         self.compositor = Compositor()
         self.plate = PlateAssist()
-        self.stabilizer = TemporalStabilizer(0.5)
+        self.plate.threshold = self.settings.plate_sensitivity
+        self.plate.furniture = self.settings.plate_furniture
+        self.stabilizer = TemporalStabilizer(self.settings.temporal_smooth)
+        self.face_tracker = None   # FaceTracker (fun props), created lazily on first use
         self.semantic = None   # created lazily (only if the option is used)
         self.subject = None    # SubjectLock (MatAnyone 2 tracker process), created lazily
         self.lock = threading.RLock()
@@ -97,6 +100,12 @@ class Studio:
                 except Exception:  # noqa: BLE001
                     pass
         self.subject = None
+        if self.face_tracker is not None:
+            try:
+                self.face_tracker.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.face_tracker = None
 
     def start_plate_capture(self):
         with self.lock:
@@ -106,6 +115,23 @@ class Studio:
     def set_background_image(self, rgb: np.ndarray | None):
         with self.lock:
             self.compositor.set_background(None if rgb is None else self.upload(rgb, bgr=False))
+
+    def _track_face(self, used: torch.Tensor):
+        """Face for the fun props: small RGB frame to the CPU (throttled inside the tracker),
+        back in full-frame pixel coords. None without a model or a face."""
+        if self.face_tracker is None:
+            from .props import FaceTracker
+            self.face_tracker = FaceTracker()
+        H, W = used.shape[-2:]
+        w2 = 256
+        h2 = max(8, int(round(H * w2 / W)))
+        small = F.interpolate(used.float(), size=(h2, w2), mode="bilinear",
+                              align_corners=False)[0].clamp(0, 1)
+        rgb = (small * 255 + 0.5).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+        face = self.face_tracker(rgb, bgr=False)   # Studio frames are RGB (upload flips BGR)
+        if face is None:
+            return None
+        return face.scaled(W / w2, H / h2)
 
     # -- tensors -----------------------------------------------------------------------------
     def upload(self, frame: np.ndarray, bgr=True) -> torch.Tensor:
@@ -137,12 +163,15 @@ class Studio:
         for mode in MODES:
             for extra in ({}, {"auto_frame": True, "feather": 2.0, "choke": 1.0, "vignette": 0.3,
                               "relight": 0.3, "denoise": 0.3, "bg_blur": 0.5, "mirror": True},
-                          {"choke": -1.0, "feather": 6.0}):
+                          {"choke": -1.0, "feather": 6.0},
+                          {"layout": "cameo", "cameo_pop": True, "cameo_ring": "rainbow", "mirror": True},
+                          {"layout": "cameo", "cameo_shape": "cutout", "cameo_fill": "camera"}):
                 self.compositor(src, a, src, replace(self.settings, mode=mode, **extra))
         self.plate.difference(src, F.avg_pool2d(a.float(), self.plate.LO)) if self.plate.ready else None
         torch.cuda.synchronize(self.device)
         self.compositor.framer = saved_framer
         self.compositor.denoiser.reset()
+        self.compositor.cameo.reset()
 
     def process_tensor(self, src: torch.Tensor):
         """Returns (composited, alpha, fgr, src_used) tensors on GPU."""
@@ -199,7 +228,8 @@ class Studio:
                         self.plate.compute_chair_mask(self.semantic, other)
                     alpha = self.plate.apply_chair(used, alpha, s.chair)
             self.stats["ms_matte"] = (time.perf_counter() - t0) * 1000  # CPU-side; GPU is async
-            out = self.compositor(used, alpha, m.fgr, s)
+            face = self._track_face(used) if s.fun_props else None
+            out = self.compositor(used, alpha, m.fgr, s, face=face)
             return out, alpha, m.fgr, used
 
     def process(self, frame_bgr: np.ndarray) -> np.ndarray:

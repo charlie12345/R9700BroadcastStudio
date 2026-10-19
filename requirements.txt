@@ -18,5 +18,9 @@ easydict>=1.10
 imageio>=2.30
 iopath>=0.1.10
 tqdm>=4.60
+# screen share background (xdg-desktop-portal over D-Bus, pure Python)
+jeepney>=0.8
+# fun props (face-tracked comical overlays)
+mediapipe>=1.1
 # tests
 pytest>=8.0

@@ -42,6 +42,11 @@ done
 [ -f third_party/deepfilter/libdeep_filter_ladspa.so ] || curl -fL -o third_party/deepfilter/libdeep_filter_ladspa.so \
   https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/libdeep_filter_ladspa-0.5.6-x86_64-unknown-linux-gnu.so
 
+# BlazeFace short-range (Google AI Edge, Apache-2.0): face box + eye/nose keypoints for fun props
+mkdir -p models/mediapipe
+[ -f models/mediapipe/blaze_face_short_range.tflite ] || curl -fL -o models/mediapipe/blaze_face_short_range.tflite \
+  https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite
+
 # --- optional: Studio engines -------------------------------------------------------------------------
 if [ $STUDIO = 1 ]; then
   hf_get ZhengPeng7/BiRefNet_lite-matting models/birefnet_lite_matting   # MIT

@@ -24,7 +24,8 @@ bin/r9700-broadcast file in.mp4 out.mov --engine birefnet # offline: ProRes 4444
   is used automatically for the subject lock and Studio engines.
 * **Disk**: ~22 GB (PyTorch for ROCm ~16 GB installed, models ~3.4 GB).
 * **VRAM**: ~1.2 GB for Realtime, ~4.2 GB with the subject lock, up to ~5.2 GB for Studio Max.
-* Python 3.10+, `ffmpeg`, `pw-record`, a C compiler and `libpipewire-0.3-dev`, `git`, `curl`.
+* Python 3.10+, `ffmpeg`, `pw-record`, a C compiler and `libpipewire-0.3-dev`, `git`, `curl`, and
+  GStreamer with its PipeWire plugin (`gstreamer1.0-tools gstreamer1.0-pipewire`, for screen share).
   `scripts/install.sh` installs all of these on Debian/Ubuntu.
 * Your user in the `render` and `video` groups (`sudo usermod -aG render,video $USER`, then log out/in).
 * A UVC webcam. Tuned for the OBSBOT Tiny SE (1080p100 / 720p120), any UVC camera works.
@@ -127,7 +128,10 @@ ffmpeg and are skipped otherwise).
 
 * **Top bar**: FPS preset, camera (or "Open video file as camera…"), quality engine, and the
   ● PipeWire camera / ● V4L2 camera / ● Rec buttons.
-* **Background strip**: one-click tiles for *Camera · Blur · Green screen · Blue screen ·
+* **Draw bar** (above the preview): pen, highlighter, arrow, line, box, circle, text, numbered
+  steps, laser pointer, spotlight, magnifier and eraser, six colours, three widths, auto-fade, shape
+  snapping, "over me", undo/redo/clear. See "Drawing on the stream" below.
+* **Background strip**: one-click tiles for *Camera · Blur · Share screen · Share window · Green screen · Blue screen ·
   Transparent · Solid colour · Matte*, then your library and 8 built-in backgrounds (6 images,
   2 looping videos). Use **+ Add images / videos…**, *Ctrl+O*, or **drag files anywhere onto the
   window**. Right-click removes an item from the library (your files are never deleted).
@@ -135,12 +139,54 @@ ffmpeg and are skipped otherwise).
 * **Tabs**:
   * **Background**: blur amount with Light/Medium/Strong presets; **"Blur it"** (depth of field
     for a picture or video background); Fill/Fit/Stretch; dim; light wrap; solid colour.
+  * **Layout**: *Full size* (you over the background) or *Bubble* (you in a circle, rounded
+    square, square or frameless cut-out). See "Screen share and the bubble" below.
   * **Subject**: matte choke/feather/clip, temporal smoothing, clean plate (sensitivity +
     furniture removal), virtual key light, vignette, video noise removal.
   * **Camera**: software auto-frame and mirror, plus **OBSBOT hardware controls** (gimbal pan/tilt,
     zoom, gain, white balance, autofocus, Centre gimbal) and *Lock exposure to the frame rate*.
   * **Audio**: noise-removal mic.
   * **Output**: setup notes, recording codec, and GPU selection.
+
+### Screen share and the bubble
+
+* **Screen share as the background**: the *Share screen* / *Share window* tiles (or *Background →
+  Share a screen… / Share a window…*) put your monitor or one window behind you, with the mouse
+  pointer in it, and take over the output from any mode (green screen, transparent, blur…).
+  Screens are letterboxed, never cropped. **Crop to a region…** shows only part of the share (drag a
+  box over a still of it); it works on every desktop, and KDE's own *Share region* works too.
+  How it captures:
+
+  | Desktop | Capture |
+  |---|---|
+  | Wayland: KDE Plasma, GNOME, Sway/Hyprland/COSMIC (any xdg-desktop-portal with ScreenCast) | the desktop's own picker → PipeWire stream (GStreamer `pipewiresrc`), read straight from the PipeWire graph. The portal's `OpenPipeWireRemote` is only used inside Flatpak: with xdg-desktop-portal 1.21 + KDE it deadlocks the whole portal for window/region streams. Tick "Allow … without asking next time" in KDE's dialog to skip it next time |
+  | X11 sessions (GNOME on Xorg, XFCE, Cinnamon, MATE, …) | ffmpeg `x11grab`, pick the monitor in the Background tab |
+  | Windows | ffmpeg `gdigrab` backend is written but untested; the rest of the app is Linux-only today |
+
+* **Bubble (Layout tab)**: you in a circle / rounded square / square / frameless cut-out over *any*
+  background: screen share, pictures, videos, blur, green/blue screen and transparent (OBS gets
+  alpha only inside the bubble). It starts in the lower-right corner. **Drag it in the preview** to
+  move it, **scroll over it** to resize, or use the corner buttons. Options: zoom, follow my head,
+  what fills the bubble behind you (blurred room / real room / solid colour), ring colour (white,
+  red, black, animated rainbow, none) and width, drop shadow, and **pop out**, where your head and
+  headset break out over the top of the frame. Fun props ride along inside the bubble.
+* **Drawing on the stream** (draw bar above the preview; drawings go into every output and
+  recording, on any background):
+
+  | Tool | Key | |
+  |---|---|---|
+  | ✋ Move | Esc | stop drawing; drag the bubble |
+  | ✏️ Pen · 🖍️ Highlighter | P · H | snap turns a rough circle/box/line into a clean one; the highlighter is see-through and straightens |
+  | ➜ Arrow · ╱ Line · ▭ Box · ◯ Circle | A · I · R · O | Shift = 45° / square / circle |
+  | T Text · ① Steps | T · N | click, type, Enter · click to drop 1, 2, 3… |
+  | 🔴 Laser · 🔦 Spotlight · 🔍 Magnifier | L · S · M | glowing dot with fading trail · dim all but the pointer · 2.2× loupe |
+  | ⌫ Eraser | X | click or drag over a drawing |
+
+  Ctrl+Z / Ctrl+Shift+Z undo/redo (right-click also undoes), Delete clears. *Fade* makes drawings
+  disappear by themselves after 3/6/12 s. Drawings sit on the background under you; tick *Over me*
+  to draw on top of you too.
+* **Mirror** now flips only the camera, so a screen share or a picture with text in it never
+  comes out backwards.
 
 ### Background formats
 
