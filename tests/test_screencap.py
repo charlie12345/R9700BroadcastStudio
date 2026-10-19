@@ -97,3 +97,19 @@ def test_pipewire_reader_against_test_source():
     finally:
         src.terminate()
         src.wait()
+
+
+def test_region_crop_fits_without_cropping_more():
+    class Cap:
+        seq, error = 1, None
+        frame = np.zeros((360, 640, 4), np.uint8)
+
+        def close(self):
+            pass
+    Cap.frame[:180, :320, 1] = 255           # top-left quarter green, rest black
+    prov = sc.ScreenBackground(sc.ScreenShare(Cap()), region=(0.0, 0.0, 0.5, 0.5))
+    t = prov(270, 480, torch.device(DEV))
+    assert t.shape == (1, 3, 270, 480) and t[0, 1].mean() > 0.95   # the quarter fills the frame
+    prov.region = (0.0, 0.0, 0.25, 0.5)      # a tall strip: letterboxed, aspect kept
+    t = prov(270, 480, torch.device(DEV))
+    assert t[0, 1, 135, 240] > 0.95 and t[0, 1, 135, 5] < 0.05

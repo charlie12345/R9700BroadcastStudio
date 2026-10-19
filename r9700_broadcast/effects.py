@@ -77,6 +77,7 @@ class Settings:
     cameo_border: float = 6.0      # ring width, px at 1080p
     cameo_pop: bool = False        # head/headset break out of the top of the frame
     cameo_shadow: bool = True
+    draw_over_me: bool = False     # drawings on top of you (default: on the background, under you)
     extra: dict = field(default_factory=dict)
 
 
@@ -448,11 +449,60 @@ class Cameo:
         return out, None
 
 
+def over(out: torch.Tensor, out_alpha: torch.Tensor | None, layer):
+    """Composite a premultiplied (rgb, alpha) layer over `out` (straight colour; `out_alpha` when
+    the output is transparent)."""
+    P, A = layer
+    if out_alpha is None:
+        return P + out * (1 - A), None
+    na = A + out_alpha * (1 - A)
+    return (P + out * out_alpha * (1 - A)) / na.clamp(min=1e-4), na
+
+
+_MAG_GEO: dict = {}
+
+
+def magnify(out: torch.Tensor, mx: float, my: float, zoom: float = 2.2) -> torch.Tensor:
+    """Round loupe centred on (mx, my) (normalised) showing the frame under it `zoom`x larger."""
+    H, W = out.shape[-2:]
+    R = int(0.15 * H)
+    key = (R, out.device)
+    g = _MAG_GEO.get(key)
+    if g is None:
+        u = torch.arange(2 * R, device=out.device, dtype=torch.float32) + 0.5 - R
+        ux, uy = u.view(1, 1, 1, -1), u.view(1, 1, -1, 1)
+        d = (ux * ux + uy * uy).sqrt() - (R - 2)
+        fill = (0.5 - d).clamp(0, 1)
+        ring = (0.5 - ((d + 2.5).abs() - 2.5)).clamp(0, 1)
+        g = _MAG_GEO[key] = (ux, uy, fill, ring)
+    ux, uy, fill, ring = g
+    cx, cy = mx * W, my * H
+    gx = (ux * (2 / (zoom * W)) + (2 * cx / W - 1)).expand(1, 1, 2 * R, 2 * R)
+    gy = (uy * (2 / (zoom * H)) + (2 * cy / H - 1)).expand(1, 1, 2 * R, 2 * R)
+    patch = F.grid_sample(out.float(), torch.cat([gx, gy], 1).permute(0, 2, 3, 1), mode="bilinear",
+                          padding_mode="border", align_corners=False)
+    x0, y0 = int(round(cx)) - R, int(round(cy)) - R
+    dx0, dy0 = max(0, -x0), max(0, -y0)
+    dx1, dy1 = min(2 * R, W - x0), min(2 * R, H - y0)
+    if dx1 <= dx0 or dy1 <= dy0:
+        return out
+    out = out.clone()
+    sl = (slice(None), slice(None), slice(y0 + dy0, y0 + dy1), slice(x0 + dx0, x0 + dx1))
+    pl = (slice(None), slice(None), slice(dy0, dy1), slice(dx0, dx1))
+    region = out[sl]
+    region = patch[pl] * fill[pl] + region * (1 - fill[pl])
+    region = 1.0 * ring[pl] + region * (1 - ring[pl])
+    out[sl] = region
+    return out
+
+
 class Compositor:
     def __init__(self):
         self.framer = AutoFramer()
         self.denoiser = TemporalDenoiser()
         self.cameo = Cameo()
+        self.annotations = None   # annotate.Annotator: drawings from the preview (set by the GUI)
+        self._ann_up = None
         self.background: torch.Tensor | None = None   # (1,3,H,W) replacement background (image)
         self.background_src = None                     # callable(h,w,device)->tensor for video bgs
         self.out_alpha: torch.Tensor | None = None     # alpha of the last output (transparent mode)
@@ -515,6 +565,12 @@ class Compositor:
             fgr = fgr.flip(-1) if fgr is not None else None
             face = face.mirrored(W) if face is not None else None
         cameo = s.layout == "cameo" and alpha is not None and s.mode not in ("off", "matte")
+        strokes, live, mag = self._annotation_layers(H, W, src.device)
+        # drawings sit on the background unless they must be on top (over me / auto-frame crops
+        # the frame they were drawn on / no background to sit on)
+        under = strokes if (strokes is not None and not s.draw_over_me and not s.auto_frame
+                            and alpha is not None and s.mode in ("blur", "replace", "remove", "green",
+                                                                  "blue")) else None
         if s.denoise > 0:
             clean = self.denoiser(src, s.denoise)
             if fgr is not None:
@@ -562,6 +618,9 @@ class Compositor:
                 if s.bg_dim > 0 and s.mode in ("blur", "replace"):
                     bg = bg * (1 - s.bg_dim)
 
+                if under is not None:     # drawings on the background, under you
+                    bg, _ = over(bg, None, under)
+
                 if s.light_wrap > 0 and s.mode in ("blur", "replace"):
                     # computed on a low-res level: it is a smooth glow anyway
                     lo = 4
@@ -597,4 +656,21 @@ class Compositor:
                 if self.out_alpha is not None:
                     self.out_alpha = self.framer.crop(self.out_alpha, box)
 
+        if s.mode != "matte":
+            if strokes is not None and under is None:
+                out, self.out_alpha = over(out.float(), self.out_alpha, strokes)
+            if mag is not None:
+                out = magnify(out, *mag)
+            if live is not None:
+                out, self.out_alpha = over(out.float(), self.out_alpha, live)
         return out.clamp(0, 1)
+
+    def _annotation_layers(self, H, W, device):
+        ann = self.annotations
+        if ann is None:
+            return None, None, None
+        if self._ann_up is None:
+            from .annotate import LayerUpload
+            self._ann_up = (LayerUpload(lambda: ann.strokes_layer), LayerUpload(lambda: ann.live_layer))
+        ann.size = (W, H)
+        return self._ann_up[0](H, W, device), self._ann_up[1](H, W, device), ann.magnifier

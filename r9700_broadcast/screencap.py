@@ -3,8 +3,11 @@
 Backends (picked automatically, see `backend_name()`):
 
 * portal  - Wayland on KDE Plasma, GNOME, Sway/Hyprland/COSMIC (anything with xdg-desktop-portal):
-            the desktop's own picker dialog -> a PipeWire stream, read by a `gst-launch-1.0
+            the desktop's own picker dialog -> a PipeWire stream node, read by a `gst-launch-1.0
             pipewiresrc` subprocess. The portal's restore token is kept so the picker only shows once.
+            Outside a Flatpak sandbox the node is read straight from the session's PipeWire graph:
+            the portal's OpenPipeWireRemote call deadlocks xdg-desktop-portal 1.21 + KDE for window and
+            region streams (the whole portal stops answering until it is restarted).
 * x11     - X11 sessions (GNOME/Xorg, XFCE, Cinnamon, MATE, ...): ffmpeg x11grab of one monitor.
 * gdi     - Windows: ffmpeg gdigrab of one monitor (untested - the rest of the app is Linux-only).
 
@@ -28,18 +31,24 @@ CAPTURE_W, CAPTURE_H = 1920, 1080   # capture size; the GPU resizes to the outpu
 MONITOR, WINDOW = 1, 2               # portal source types
 
 
+SANDBOXED = os.path.exists("/.flatpak-info")
+START_TIMEOUT = 300      # seconds the desktop's picker may stay open
+
+
 def backend_name() -> str | None:
     if sys.platform == "win32":
         return "gdi" if shutil.which("ffmpeg") else None
     if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland":
-        return "portal" if portal_available() else None
+        return "portal" if portal_installed() else None
     if os.environ.get("DISPLAY"):
         return "x11" if shutil.which("ffmpeg") else None
     return None
 
 
 def can_share_windows() -> bool:
-    return backend_name() == "portal" and bool(_portal_prop("AvailableSourceTypes", 0) & WINDOW)
+    if backend_name() != "portal":
+        return False
+    return bool(portal_caps()[0] & WINDOW)
 
 
 def missing_reason() -> str:
@@ -61,25 +70,43 @@ _BUS, _OBJ = "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop"
 _IFACE = "org.freedesktop.portal.ScreenCast"
 
 
-def _portal_prop(name, default=None):
-    try:
+class PortalNotResponding(RuntimeError):
+    pass
+
+
+_caps = None
+
+
+def portal_caps():
+    """(AvailableSourceTypes, AvailableCursorModes), asked once per process. Raises
+    PortalNotResponding when xdg-desktop-portal is hung."""
+    global _caps
+    if _caps is None:
         from jeepney import DBusAddress, Properties
         from jeepney.io.blocking import open_dbus_connection
-        with open_dbus_connection(bus="SESSION") as conn:
-            msg = Properties(DBusAddress(_OBJ, _BUS, _IFACE)).get(name)
-            return conn.send_and_get_reply(msg, timeout=3).body[0][1]
-    except Exception:  # noqa: BLE001
-        return default
+        try:
+            with open_dbus_connection(bus="SESSION") as conn:
+                addr = Properties(DBusAddress(_OBJ, _BUS, _IFACE))
+                types = conn.send_and_get_reply(addr.get("AvailableSourceTypes"), timeout=3).body[0][1]
+                cursors = conn.send_and_get_reply(addr.get("AvailableCursorModes"), timeout=3).body[0][1]
+        except TimeoutError as e:
+            raise PortalNotResponding(HUNG_HINT) from e
+        _caps = (int(types), int(cursors))
+    return _caps
 
 
-def portal_available() -> bool:
+HUNG_HINT = ("the desktop's screen-sharing service (xdg-desktop-portal) is not responding. Restart it "
+             "with: systemctl --user restart xdg-desktop-portal")
+
+
+def portal_installed() -> bool:
     if not shutil.which("gst-launch-1.0"):
         return False
     try:
         import jeepney  # noqa: F401
     except ImportError:
         return False
-    return bool(_portal_prop("AvailableSourceTypes", 0) & MONITOR)
+    return True
 
 
 class PortalCancelled(RuntimeError):
@@ -93,13 +120,15 @@ class PortalSession:
     def __init__(self):
         from jeepney.io.blocking import open_dbus_connection
         self.conn = open_dbus_connection(bus="SESSION", enable_fds=True)
+        self._lock = threading.Lock()
+        self.cancelled = False
         self.session = None
         self.node = None
         self.fd = None
         self.size = None
         self.restore_token = None
 
-    def _request(self, method, signature, *args, timeout=600):
+    def _request(self, method, signature, *args, timeout=START_TIMEOUT):
         """Call a portal method that answers through a Request object's Response signal."""
         from jeepney import DBusAddress, MatchRule, message_bus, new_method_call
         from jeepney.io.blocking import Proxy
@@ -113,11 +142,25 @@ class PortalSession:
         opts["handle_token"] = ("s", token)
         args = (*args[:-1], opts)
         with self.conn.filter(rule) as q:
-            self.conn.send_and_get_reply(
-                new_method_call(DBusAddress(_OBJ, _BUS, _IFACE), method, signature, args), timeout=10)
-            sig = self.conn.recv_until_filtered(q, timeout=timeout)
+            try:
+                self.conn.send_and_get_reply(
+                    new_method_call(DBusAddress(_OBJ, _BUS, _IFACE), method, signature, args), timeout=10)
+            except TimeoutError as e:
+                raise PortalNotResponding(HUNG_HINT) from e
+            # wait in short slices so cancel() (another thread) can end the wait
+            t_end = time.monotonic() + timeout
+            sig = None
+            while sig is None:
+                if self.cancelled:
+                    raise PortalCancelled("screen share was cancelled")
+                if time.monotonic() > t_end:
+                    raise TimeoutError(f"no answer from the screen-share picker after {timeout} s")
+                try:
+                    sig = self.conn.recv_until_filtered(q, timeout=0.25)
+                except TimeoutError:
+                    pass
         code, results = sig.body
-        if code == 1:
+        if code == 1 or self.cancelled:
             raise PortalCancelled("screen share was cancelled")
         if code != 0:
             raise RuntimeError(f"portal {method} failed (code {code})")
@@ -128,8 +171,8 @@ class PortalSession:
         res = self._request("CreateSession", "a{sv}",
                             {"session_handle_token": ("s", "r9700_" + secrets.token_hex(6))})
         self.session = res["session_handle"][1]
-        avail = _portal_prop("AvailableSourceTypes", MONITOR) or MONITOR
-        cursors = _portal_prop("AvailableCursorModes", 1) or 1
+        avail, cursors = portal_caps()
+        avail, cursors = avail or MONITOR, cursors or 1
         opts = {"types": ("u", (source_types & avail) or MONITOR),
                 "multiple": ("b", False),
                 "persist_mode": ("u", 2)}          # remember the choice until revoked
@@ -147,10 +190,16 @@ class PortalSession:
             self.size = tuple(props["size"][1])
         if "restore_token" in res:
             self.restore_token = res["restore_token"][1]
-        reply = self.conn.send_and_get_reply(new_method_call(
-            DBusAddress(_OBJ, _BUS, _IFACE), "OpenPipeWireRemote", "oa{sv}", (self.session, {})), timeout=10)
-        self.fd = reply.body[0].to_raw_fd()
+        if SANDBOXED:   # a sandbox can only see the node through the portal's restricted remote
+            reply = self.conn.send_and_get_reply(new_method_call(
+                DBusAddress(_OBJ, _BUS, _IFACE), "OpenPipeWireRemote", "oa{sv}", (self.session, {})),
+                timeout=10)
+            self.fd = reply.body[0].to_raw_fd()
         return self
+
+    def cancel(self):
+        """Abort a pending pick from another thread (the picker dialog closes with the session)."""
+        self.cancelled = True
 
     def close(self):
         from jeepney import DBusAddress, new_method_call
@@ -278,17 +327,21 @@ class ScreenShare:
 
 
 def start_share(kind: str = "monitor", restore_token: str | None = None, geometry=None, fps: int = 30,
-                on_end=None) -> ScreenShare:
+                on_end=None, on_session=None) -> ScreenShare:
     """Blocking (the portal waits for the user's pick): call from a worker thread.
-    kind: "monitor" | "window". geometry (x, y, w, h) is only used by the x11/gdi backends."""
+    kind: "monitor" | "window". geometry (x, y, w, h) is only used by the x11/gdi backends.
+    on_session(PortalSession) is called before the picker opens, so the caller can cancel() it."""
     backend = backend_name()
     if backend is None:
         raise RuntimeError(missing_reason())
     if backend == "portal":
         ps = PortalSession()
+        if on_session:
+            on_session(ps)
         try:
             ps.start(WINDOW if kind == "window" else MONITOR, restore_token)
-            cap = ScreenCapture(gst_command(ps.node, ps.fd), pass_fds=(ps.fd,), on_end=on_end)
+            fds = (ps.fd,) if ps.fd is not None else ()
+            cap = ScreenCapture(gst_command(ps.node, ps.fd), pass_fds=fds, on_end=on_end)
         except Exception:
             ps.close()
             raise
@@ -310,31 +363,52 @@ def start_share(kind: str = "monitor", restore_token: str | None = None, geometr
 
 class ScreenBackground:
     """GPU-side provider for Compositor.background_src. Screens are always fitted (letterboxed),
-    never cropped, so nothing that is being shown gets cut off."""
+    never cropped, so nothing that is being shown gets cut off. `region` = (x0, y0, x1, y1), 0..1
+    of the captured frame, shows only that part (in-app region crop: works on every desktop)."""
 
     kind = "screen"
 
-    def __init__(self, share: ScreenShare):
+    def __init__(self, share: ScreenShare, region=None):
         self.share = share
         self.path = None
         self.fit = "contain"
-        self._cache = None   # (seq, out_size, tensor)
+        self.region = region
+        self._cache = None   # (seq, out_size, region, tensor)
 
     def __call__(self, h, w, device):
         import torch
         import torch.nn.functional as F
         cap = self.share.capture
-        seq, frame = cap.seq, cap.frame
+        seq, frame, region = cap.seq, cap.frame, self.region
         if frame is None:
-            return self._cache[2] if self._cache else None
-        if self._cache is not None and self._cache[0] == seq and self._cache[1] == (h, w):
-            return self._cache[2]
+            return self._cache[3] if self._cache else None
+        if self._cache is not None and self._cache[:3] == (seq, (h, w), region):
+            return self._cache[3]
+        if region is not None:
+            fh, fw = frame.shape[:2]
+            x0, y0, x1, y1 = region
+            xa, xb = int(x0 * fw), max(int(x0 * fw) + 8, int(x1 * fw))
+            ya, yb = int(y0 * fh), max(int(y0 * fh) + 8, int(y1 * fh))
+            frame = np.ascontiguousarray(frame[ya:yb, xa:xb])
         t = torch.from_numpy(frame).pin_memory().to(device, non_blocking=True)
         t = t[..., [2, 1, 0]].permute(2, 0, 1).unsqueeze(0).half() / 255     # BGRx -> RGB
-        if t.shape[-2:] != (h, w):
-            t = F.interpolate(t, size=(h, w), mode="bilinear", align_corners=False, antialias=True)
-        self._cache = (seq, (h, w), t)
+        ih, iw = t.shape[-2:]
+        if (ih, iw) != (h, w):
+            k = min(w / iw, h / ih)                                          # fit, keep aspect
+            nh, nw = max(1, round(ih * k)), max(1, round(iw * k))
+            t = F.interpolate(t, size=(nh, nw), mode="bilinear", align_corners=False, antialias=True)
+            if (nh, nw) != (h, w):
+                out = torch.zeros((1, 3, h, w), dtype=t.dtype, device=t.device)
+                y, x = (h - nh) // 2, (w - nw) // 2
+                out[..., y:y + nh, x:x + nw] = t
+                t = out
+        self._cache = (seq, (h, w), region, t)
         return t
+
+    def snapshot(self) -> np.ndarray | None:
+        """Newest full captured frame (BGRx), for the region chooser."""
+        f = self.share.capture.frame
+        return None if f is None else f.copy()
 
     def close(self):
         self.share.close()
