@@ -65,7 +65,7 @@ Success ends with `Installed. Start it with: r9700-broadcast`.
 ## 5. Verify (optional but recommended)
 
 ```bash
-PYTHONPATH=. .venv/bin/python -m pytest -q tests      # expect: 91 passed
+PYTHONPATH=. .venv/bin/python -m pytest -q tests      # expect: 95 passed
 ```
 
 ## 6. Tell the user how to start it

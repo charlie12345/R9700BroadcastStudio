@@ -118,3 +118,54 @@ class NoiseRemovalMic:
         if self.conf and os.path.exists(self.conf):
             os.unlink(self.conf)
         self.conf = None
+
+
+class LevelMeter:
+    """Live peak level of a capture target (mic or '<sink>.monitor'), for the Output tab meters.
+    A low-rate (16 kHz mono) pw-record of its own: costs ~nothing and never touches recordings."""
+
+    RATE = 16000
+
+    def __init__(self, target: str):
+        import threading
+
+        from .media import pw_target_args
+        self.target = target
+        self.peak = 0.0            # newest 25 ms block peak, 0..1
+        self.clipped = False
+        self.proc = subprocess.Popen(["pw-record", "--raw", "--rate", str(self.RATE), "--channels", "1",
+                                      "--format", "s16", "--latency", "25ms", *pw_target_args(target), "-"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+
+    def _loop(self):
+        import numpy as np
+        chunk = self.RATE // 40 * 2
+        src = self.proc.stdout
+        try:
+            while True:
+                b = src.read(chunk)
+                if not b:
+                    return
+                a = np.frombuffer(b[: len(b) & ~1], np.int16)
+                if a.size:
+                    m = int(np.abs(a.astype(np.int32)).max())
+                    self.peak = m / 32768.0
+                    if m >= 32700:
+                        self.clipped = True
+        except (OSError, ValueError):
+            pass
+
+    @property
+    def alive(self):
+        return self.proc.poll() is None
+
+    def stop(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self._t.join(timeout=2)

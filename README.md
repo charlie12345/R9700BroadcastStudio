@@ -317,8 +317,13 @@ plate and keeps a crisp chair cut-out (BiRefNet on the empty-room plate) in ever
 
 ## Recording with sound, snapshots and thumbnails
 
-* **● Rec** records video *and* sound: the AI noise-removed "R9700 Broadcast Mic" when it is on,
-  otherwise the default microphone (Output → Recording → Sound). The mic is captured with
+* **● Rec** records video *and* sound. Output → Recording → **Microphone** picks track 1: Auto (the AI
+  noise-removed "R9700 Broadcast Mic" when it is on, otherwise the system default), the AI mic, the
+  system default, or any specific microphone (⟳ rescans after plugging one in). **Desktop audio**
+  (off by default) adds track 2: what a speaker/headset plays (game, browser, call), stereo, kept
+  separate from the mic so you can balance them in Resolve / Kdenlive. Live **level meters** show
+  both while the Output tab is open, and a small pair sits next to ● Rec while recording. A device
+  that disappears mid-take is filled with silence; the file still closes cleanly. The mic is captured with
   `pw-record` into its own ffmpeg pipe, starting at the first video frame; video is stamped by the
   wall clock and written at constant frame rate, so dropped frames never shift the sound. Audio
   is delayed by the measured pipeline latency + 2 frames (camera); a ±200 ms lip-sync trim is

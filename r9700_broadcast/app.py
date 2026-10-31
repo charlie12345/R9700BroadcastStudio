@@ -390,6 +390,56 @@ class PreviewView(QWidget):
             p.drawText(box.adjusted(6, 4, 0, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, "9:16")
 
 
+class LevelBar(QWidget):
+    """Peak meter, -60..0 dBFS: green, yellow above -12 dB, red above -3 dB, with a 1 s peak hold."""
+
+    def __init__(self, height=12, label=True):
+        super().__init__()
+        self.setFixedHeight(height)
+        self.setMinimumWidth(40)
+        self.db = -90.0
+        self.hold, self._hold_t = -90.0, 0.0
+        self.label = label
+        self.active = False
+
+    @staticmethod
+    def _x(db, w):
+        return int(w * min(1.0, max(0.0, (db + 60) / 60)))
+
+    def set_peak(self, peak):
+        import math
+        db = 20 * math.log10(max(peak, 1e-5))
+        self.db = db if db > self.db else max(db, self.db - 1.5)     # fast attack, smooth fall
+        now = time.monotonic()
+        if db >= self.hold or now - self._hold_t > 1.0:
+            self.hold, self._hold_t = db, now
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        w = self.width() - (46 if self.label else 0)
+        h = self.height()
+        p.fillRect(0, 0, w, h, QColor("#1b1c22"))
+        if self.active:
+            x = self._x(self.db, w)
+            y1, y2 = self._x(-12, w), self._x(-3, w)
+            p.fillRect(0, 0, min(x, y1), h, QColor("#2ecc71"))
+            if x > y1:
+                p.fillRect(y1, 0, min(x, y2) - y1, h, QColor("#f1c40f"))
+            if x > y2:
+                p.fillRect(y2, 0, x - y2, h, QColor("#e74c3c"))
+            hx = self._x(self.hold, w)
+            if hx > 0:
+                p.fillRect(max(0, hx - 2), 0, 2, h, QColor("#ffffff"))
+        p.setPen(QColor("#3a3c46"))
+        for db in (-48, -36, -24, -12, -6):
+            p.drawLine(self._x(db, w), 0, self._x(db, w), h)
+        if self.label:
+            p.setPen(QColor("#8b8d9a"))
+            txt = (f"{self.db:5.0f} dB" if self.db > -60 else "  −∞ dB") if self.active else "  off"
+            p.drawText(QRect(w, 0, 46, h), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, txt)
+
+
 class VerticalView(QWidget):
     """Live 9:16 picture of the vertical crop with the apps' UI safe zones on top. Drag = pan,
     scroll = zoom (zoom is locked while a vertical recording runs)."""
@@ -592,6 +642,7 @@ class Main(QMainWindow):
                                        float(vc.get("zoom", 1.0)))
         self.rec_mode = self.cfg.get("rec_mode", "long") if self.cfg.get("rec_mode") in VT.REC_MODES else "long"
         self.recording = False
+        self.meters = {}                  # "mic" / "desk" -> audio.LevelMeter while shown
 
         self.bridge = Bridge()
         self.bridge.preview.connect(self._on_preview)
@@ -635,8 +686,12 @@ class Main(QMainWindow):
         tabs.addTab(self._scroll(self._build_fun_tab()), "Fun")
         tabs.addTab(self._scroll(self._build_camera_tab()), "Camera")
         tabs.addTab(self._scroll(self._build_audio_tab()), "Audio")
-        tabs.addTab(self._scroll(self._build_output_tab()), "Output")
+        self._out_tab = self._scroll(self._build_output_tab())
+        tabs.addTab(self._out_tab, "Output")
         tabs.setFixedWidth(430)
+        self.tabs = tabs
+        tabs.currentChanged.connect(lambda _: self._update_meters())
+        self.meter_timer = QTimer(self, interval=40, timeout=self._tick_meters)
         outer.addWidget(tabs)
         self.setCentralWidget(root)
         self.setStyleSheet(STYLE)
@@ -841,6 +896,18 @@ class Main(QMainWindow):
         self.rec_btn.setCheckable(True)
         self.rec_btn.toggled.connect(self._toggle_record)
         h.addWidget(self.rec_btn)
+        mm = QWidget()
+        ml = QVBoxLayout(mm)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.setSpacing(2)
+        self.mini_mic, self.mini_desk = LevelBar(5, False), LevelBar(5, False)
+        ml.addWidget(self.mini_mic)
+        ml.addWidget(self.mini_desk)
+        mm.setFixedWidth(56)
+        mm.setToolTip("Sound being recorded: top = microphone, bottom = desktop audio")
+        mm.hide()
+        self.mini_meters = mm
+        h.addWidget(mm)
         self.vert_btn = QPushButton("Vertical 9:16")
         self.vert_btn.setCheckable(True)
         self.vert_btn.setToolTip("Show the vertical (9:16) recording template beside the preview")
@@ -964,6 +1031,7 @@ class Main(QMainWindow):
         if on:
             codec = self.codec_combo.currentData()
             audio_choice = self.audio_combo.currentData()
+            desk_choice = self.desk_combo.currentData()
             audio_adj = float(self.audio_sync.value())
             mode = self.rec_mode
             name = self.take_name.text()
@@ -985,24 +1053,28 @@ class Main(QMainWindow):
                 # the picture reaches the recorder later than the sound (camera + processing):
                 # delay the audio by the measured pipeline latency + ~2 frames of camera latency
                 offset = p.stats.latency_ms + 2000 / fps + audio_adj
+                from .media import resolve_desktop
                 audio = resolve_audio(audio_choice)
+                desktop = resolve_desktop(desk_choice)
                 msgs = []
                 for kind, path in paths.items():
                     try:
                         if kind == "vertical":
                             crop_size = vframe.size(W, H)
                             rec = Recorder(path, W, H, fps, codec, alpha=codec == "prores4444", audio=audio,
-                                           audio_offset_ms=offset, crop=vframe,
+                                           audio_offset_ms=offset, desktop=desktop, crop=vframe,
                                            out_size=VT.output_size(vsize_key, crop_size))
                             p._swap_output("record_v", rec)
                         else:
                             rec = Recorder(path, W, H, fps, codec, alpha=codec == "prores4444", audio=audio,
-                                           audio_offset_ms=offset)
+                                           audio_offset_ms=offset, desktop=desktop)
                             p._swap_output("record", rec)
                         msgs.append(os.path.basename(path))
                     except Exception as e:  # noqa: BLE001
                         self.bridge.error.emit(f"{kind} recording failed: {e}")
-                self.bridge.error.emit("Recording" + (f" with sound ({audio})" if audio else " without sound")
+                snd = [f"mic ({audio})"] if audio else []
+                snd += ["desktop audio (track 2)"] if desktop else []
+                self.bridge.error.emit("Recording " + (" + ".join(snd) if snd else "without sound")
                                        + " → " + " + ".join(msgs))
             self.pipe.command(do)
         else:
@@ -1010,8 +1082,10 @@ class Main(QMainWindow):
             self.pipe.remove_output("record_v")
             self.view.vframe_size = None
             self._on_error(f"Saved to {RECORD_DIR}")
+        self._update_meters()
         self.rec_btn.setText("■ Stop" if on else self._rec_label())
-        for wdg in (self.rec_mode_combo, self.vsize_combo, self.vzoom_slider, self.take_name):
+        for wdg in (self.rec_mode_combo, self.vsize_combo, self.vzoom_slider, self.take_name,
+                    self.audio_combo, self.desk_combo):
             wdg.setEnabled(not on)
 
     # ---- vertical template ---------------------------------------------------------------------
@@ -1890,6 +1964,73 @@ class Main(QMainWindow):
         else:
             self.mic.stop()
         self.mic_btn.setText("Stop noise-removal mic" if on else "Start noise-removal mic")
+        QTimer.singleShot(800, lambda: self._update_meters(restart=True))   # "Auto" now means another mic
+
+    def _fill_audio_combos(self):
+        from .audio import list_microphones
+        from .media import list_outputs
+        cur_mic = self.audio_combo.currentData() or self.cfg.get("rec_audio", "auto")
+        cur_desk = self.desk_combo.currentData() or self.cfg.get("rec_desktop", "none")
+        self.audio_combo.clear()
+        for k, lab in (("auto", "Auto (AI mic if on)"), ("studio", "R9700 Broadcast Mic (AI noise removal)"),
+                       ("default", "System default microphone")):
+            self.audio_combo.addItem(lab, k)
+        for name, desc in list_microphones():
+            self.audio_combo.addItem("🎙 " + desc, name)
+        self.audio_combo.addItem("No sound", "none")
+        i = self.audio_combo.findData(cur_mic)
+        if i < 0:   # saved mic is unplugged: say so instead of silently recording another one
+            self.audio_combo.addItem(f"(not connected) {cur_mic}", cur_mic)
+            i = self.audio_combo.count() - 1
+        self.audio_combo.setCurrentIndex(i)
+        self.desk_combo.clear()
+        self.desk_combo.addItem("Off", "none")
+        self.desk_combo.addItem("What you hear (default output)", "default")
+        for name, desc in list_outputs():
+            self.desk_combo.addItem("🔊 " + desc, name)
+        self.desk_combo.setCurrentIndex(max(0, self.desk_combo.findData(cur_desk)))
+        self._update_meters(restart=True)
+
+    def _meter_targets(self):
+        from .media import resolve_audio, resolve_desktop
+        return {"mic": resolve_audio(self.audio_combo.currentData()),
+                "desk": resolve_desktop(self.desk_combo.currentData())}
+
+    def _update_meters(self, restart=False):
+        """Run the level meters only while someone can see them: Output tab open, or recording."""
+        if not hasattr(self, "tabs") or not hasattr(self, "desk_combo"):
+            return
+        from .audio import LevelMeter
+        show = self.tabs.currentWidget() is self._out_tab or self.recording
+        targets = self._meter_targets() if show else {}
+        for kind, bar in (("mic", self.mic_meter), ("desk", self.desk_meter)):
+            m = self.meters.get(kind)
+            tgt = targets.get(kind)
+            if m is not None and (restart or not show or m.target != tgt or not m.alive):
+                m.stop()
+                self.meters.pop(kind)
+                m = None
+            if show and tgt and m is None:
+                try:
+                    self.meters[kind] = LevelMeter(tgt)
+                except Exception as e:  # noqa: BLE001
+                    self._on_error(f"level meter: {e}")
+            bar.active = kind in self.meters
+            bar.update()
+        self.mini_meters.setVisible(self.recording)
+        self.mini_desk.setVisible("desk" in self.meters)
+        if self.meters:
+            self.meter_timer.start()
+        else:
+            self.meter_timer.stop()
+
+    def _tick_meters(self):
+        for kind, bars in (("mic", (self.mic_meter, self.mini_mic)), ("desk", (self.desk_meter, self.mini_desk))):
+            m = self.meters.get(kind)
+            for b in bars:
+                b.active = m is not None
+                if m is not None:
+                    b.set_peak(m.peak)
 
     def _build_output_tab(self):
         import torch
@@ -1927,14 +2068,34 @@ class Main(QMainWindow):
         gl.addWidget(self.codec_combo)
         f = QFormLayout()
         self.audio_combo = QComboBox()
-        for k, lab in (("auto", "Auto (AI mic if on)"), ("studio", "AI noise-removed mic"),
-                       ("default", "Default microphone"), ("none", "No sound")):
-            self.audio_combo.addItem(lab, k)
-        self.audio_combo.setCurrentIndex(max(0, self.audio_combo.findData(self.cfg.get("rec_audio", "auto"))))
-        self.audio_combo.activated.connect(lambda _: self._cfg_set("rec_audio", self.audio_combo.currentData()))
-        self.audio_combo.setToolTip("Auto: the R9700 Broadcast Mic (AI noise removal) when it is on, otherwise "
-                                    "your default microphone.")
-        f.addRow("Sound", self.audio_combo)
+        self.desk_combo = QComboBox()
+        for c in (self.audio_combo, self.desk_combo):
+            # long device names must not widen the whole tab past the window
+            c.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            c.setMinimumContentsLength(12)
+            c.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.audio_combo.setToolTip("Track 1. Auto: the R9700 Broadcast Mic (AI noise removal) when it is on, "
+                                    "otherwise your default microphone.")
+        self.audio_combo.activated.connect(lambda _: (self._cfg_set("rec_audio", self.audio_combo.currentData()),
+                                                      self._update_meters(restart=True)))
+        mic_row = QHBoxLayout()
+        mic_row.addWidget(self.audio_combo, 1)
+        rescan = QPushButton("⟳")
+        rescan.setFixedWidth(30)
+        rescan.setToolTip("Look for newly plugged-in microphones and speakers")
+        rescan.clicked.connect(self._fill_audio_combos)
+        mic_row.addWidget(rescan)
+        f.addRow("Microphone", mic_row)
+        self.mic_meter = LevelBar()
+        f.addRow("", self.mic_meter)
+        self.desk_combo.setToolTip("Track 2 (separate, stereo): what your speakers / headset play - game, "
+                                   "browser, calls. Off by default.")
+        self.desk_combo.activated.connect(lambda _: (self._cfg_set("rec_desktop", self.desk_combo.currentData()),
+                                                     self._update_meters(restart=True)))
+        f.addRow("Desktop audio", self.desk_combo)
+        self.desk_meter = LevelBar()
+        f.addRow("", self.desk_meter)
+        self._fill_audio_combos()
         self.audio_sync = QSlider(Qt.Orientation.Horizontal)
         self.audio_sync.setRange(-200, 200)
         self.audio_sync.setValue(int(self.cfg.get("rec_audio_adj", 0)))
@@ -1958,6 +2119,9 @@ class Main(QMainWindow):
         gl.addWidget(_hint(f"Videos: {RECORD_DIR}. Snapshots and thumbnails: ~/Pictures/R9700 Broadcast. "
                            "Sound is synced automatically (pipeline latency is compensated); use the trim only if "
                            "lips look early (−) or late (+). Use ProRes with the Transparent tile to keep alpha.<br>"
+                           "Microphone and desktop audio are <b>separate tracks</b> (1 and 2) in the file, so you "
+                           "can balance them in Resolve / Kdenlive. Meters run while this tab is open or "
+                           "while recording.<br>"
                            "<b>Vertical 9:16</b> (button in the top bar): record Long form, Vertical or both at once "
                            "→ Longform_&lt;name&gt; / Vertical_&lt;name&gt;."))
         v.addWidget(g)
@@ -1986,6 +2150,9 @@ class Main(QMainWindow):
         if self.screen_pending is not None:
             self.screen_pending.cancel()
         self._save_config()
+        for m in self.meters.values():
+            m.stop()
+        self.meters.clear()
         self.mic.stop()
         self.pipe.stop()
         if self.provider is not None:
@@ -2068,3 +2235,6 @@ def _test_action(w: Main, action: str):
         w.rec_btn.setChecked(False)
     elif action == "wait":
         pass
+    elif action == "meters":
+        print("METERS", {k: (m.target, m.alive, round(m.peak, 4)) for k, m in w.meters.items()},
+              "tab_width_ok", w._out_tab.widget().width() <= w._out_tab.viewport().width(), flush=True)
