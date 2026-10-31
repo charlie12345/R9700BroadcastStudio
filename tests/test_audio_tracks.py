@@ -89,9 +89,34 @@ def test_missing_device_still_closes(tmp_path):
     t0 = time.time()
     rec.close()
     assert time.time() - t0 < 15
-    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
-                         capture_output=True, text=True, check=True).stdout.split()
-    assert out.count("video") == 1
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration", "-of",
+                          "csv=p=0", path], capture_output=True, text=True, check=True).stdout.split()
+    kinds = [o.split(",")[0] for o in out]
+    assert kinds.count("video") == 1 and kinds.count("audio") == 2
+    # never falls back to the default mic: the tracks are pure silence, as long as the video
+    for i in range(2):
+        pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-map", f"0:a:{i}", "-f", "s16le", "-ac", "1",
+                              "-"], capture_output=True, check=True).stdout
+        a = np.frombuffer(pcm, np.int16)
+        assert a.size > 48000 * 0.7 and np.abs(a).max() == 0
+
+
+def test_target_exists(null_sink):
+    from r9700_broadcast.media import target_exists
+    assert target_exists(f"{null_sink}.monitor")
+    assert not target_exists("no_such_device_xyz")
+    assert not target_exists("no_such_sink.monitor")
+    assert target_exists("@default")
+
+
+def test_level_meter_missing_device_is_silent():
+    if not HAVE_PW:
+        pytest.skip("needs PipeWire tools")
+    from r9700_broadcast.audio import LevelMeter
+    m = LevelMeter("no_such_device_xyz")
+    time.sleep(0.5)
+    assert m.missing and m.alive and m.peak == 0.0
+    m.stop()
 
 
 def test_level_meter(null_sink):

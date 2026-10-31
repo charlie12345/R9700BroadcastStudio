@@ -322,7 +322,8 @@ plate and keeps a crisp chair cut-out (BiRefNet on the empty-room plate) in ever
   system default, or any specific microphone (⟳ rescans after plugging one in). **Desktop audio**
   (off by default) adds track 2: what a speaker/headset plays (game, browser, call), stereo, kept
   separate from the mic so you can balance them in Resolve / Kdenlive. Live **level meters** show
-  both while the Output tab is open, and a small pair sits next to ● Rec while recording. A device
+  both while the Output or Audio tab is open (the Audio tab also shows the noise-removal mic's raw
+  input vs. its cleaned output), and a small pair sits next to ● Rec while recording. A device
   that disappears mid-take is filled with silence; the file still closes cleanly. The mic is captured with
   `pw-record` into its own ffmpeg pipe, starting at the first video frame; video is stamped by the
   wall clock and written at constant frame rate, so dropped frames never shift the sound. Audio

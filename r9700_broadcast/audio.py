@@ -129,11 +129,12 @@ class LevelMeter:
     def __init__(self, target: str):
         import threading
 
-        from .media import pw_target_args
+        from .media import pw_target_args, target_exists
         self.target = target
         self.peak = 0.0            # newest 25 ms block peak, 0..1
         self.clipped = False
-        self.proc = subprocess.Popen(["pw-record", "--raw", "--rate", str(self.RATE), "--channels", "1",
+        self.missing = not target_exists(target)   # never meter the default mic in its place
+        self.proc = None if self.missing else subprocess.Popen(["pw-record", "--raw", "--rate", str(self.RATE), "--channels", "1",
                                       "--format", "s16", "--latency", "25ms", *pw_target_args(target), "-"],
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self._t = threading.Thread(target=self._loop, daemon=True)
@@ -141,6 +142,8 @@ class LevelMeter:
 
     def _loop(self):
         import numpy as np
+        if self.proc is None:
+            return
         chunk = self.RATE // 40 * 2
         src = self.proc.stdout
         try:
@@ -159,10 +162,10 @@ class LevelMeter:
 
     @property
     def alive(self):
-        return self.proc.poll() is None
+        return self.proc is None or self.proc.poll() is None
 
     def stop(self):
-        if self.proc.poll() is None:
+        if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=2)
