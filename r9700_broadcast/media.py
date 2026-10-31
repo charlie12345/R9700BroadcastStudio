@@ -144,10 +144,23 @@ def pw_target_args(target: str) -> list[str]:
     speaker/headset plays - desktop audio), or a source node name (a specific microphone)."""
     if target == "@default":
         return []
-    # dont-fallback: a missing device must give silence, never quietly record the default mic instead
     if target.endswith(".monitor"):
-        return ["--target", target[:-8], "-P", "{ stream.capture.sink = true node.dont-fallback = true }"]
-    return ["--target", target, "-P", "{ node.dont-fallback = true }"]
+        return ["--target", target[:-8], "-P", "{ stream.capture.sink = true }"]
+    return ["--target", target]
+
+
+def target_exists(target: str) -> bool:
+    """Is this capture target present right now? pw-record silently records the DEFAULT mic when its
+    --target is missing (and node.dont-fallback breaks even present targets on WirePlumber 0.5), so
+    callers check first and record silence for a missing device instead."""
+    if target == "@default" or shutil.which("pactl") is None:
+        return True
+    kind, name = ("sinks", target[:-8]) if target.endswith(".monitor") else ("sources", target)
+    try:
+        out = subprocess.run(["pactl", "list", "short", kind], capture_output=True, text=True, timeout=3).stdout
+    except Exception:  # noqa: BLE001
+        return True
+    return any(line.split("\t")[1:2] == [name] for line in out.splitlines())
 
 
 def default_sink() -> str | None:
@@ -282,11 +295,13 @@ class Recorder:
         self.dropped = 0
         self._vt = threading.Thread(target=self._video_loop, daemon=True)
         self._vt.start()
+        self.missing = [t.title for t in self.tracks if not target_exists(t.target)]
         for t in self.tracks:
-            t.proc = subprocess.Popen(["pw-record", "--raw", "--rate", str(self.RATE), "--channels",
-                                       str(t.channels), "--format", "s16", "--latency", "20ms",
-                                       *pw_target_args(t.target), "-"],
-                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if t.title not in self.missing:   # a missing device is recorded as silence, never the default mic
+                t.proc = subprocess.Popen(["pw-record", "--raw", "--rate", str(self.RATE), "--channels",
+                                           str(t.channels), "--format", "s16", "--latency", "20ms",
+                                           *pw_target_args(t.target), "-"],
+                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             t.thread = threading.Thread(target=self._audio_loop, args=(t,), daemon=True)
             t.thread.start()
 
@@ -297,14 +312,15 @@ class Recorder:
         import select
         frame = 2 * t.channels
         chunk = self.RATE // 50 * frame          # 20 ms of s16
-        fd = t.proc.stdout.fileno()
+        fd = t.proc.stdout.fileno() if t.proc is not None else None
         bps = self.RATE * frame                  # bytes per second
         try:
             # audio from before the first video frame is discarded
             while not self._started.is_set() and not self._closing:
-                if select.select([fd], [], [], 0.05)[0] and not os.read(fd, 65536):
+                if fd is None:
+                    time.sleep(0.02)
+                elif select.select([fd], [], [], 0.05)[0] and not os.read(fd, 65536):
                     fd = None
-                    break
             t0 = time.perf_counter()
             # audio_offset_ms > 0 delays the sound (silence first), < 0 trims it
             off = int(self.audio_offset_ms * self.RATE / 1000) * frame
@@ -342,8 +358,16 @@ class Recorder:
                     pad -= pad % frame
                     os.write(t.fd_w, bytes(pad))
                     written += pad
-        except (BrokenPipeError, OSError, ValueError):
+        except (BrokenPipeError, OSError, ValueError, TypeError):
             pass
+        finally:
+            # whatever happened, end this input so ffmpeg can finish the file
+            if t.fd_w is not None:
+                try:
+                    os.close(t.fd_w)
+                except OSError:
+                    pass
+                t.fd_w = None
 
     def _video_loop(self):
         while True:
@@ -374,6 +398,8 @@ class Recorder:
         self._vt.join(timeout=30)
         self._closing = True
         for t in self.tracks:
+            if t.proc is None:
+                continue
             t.proc.terminate()
             try:
                 t.proc.wait(timeout=3)
