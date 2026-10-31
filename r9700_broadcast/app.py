@@ -685,7 +685,8 @@ class Main(QMainWindow):
         tabs.addTab(self._scroll(self._build_subject_tab()), "Subject")
         tabs.addTab(self._scroll(self._build_fun_tab()), "Fun")
         tabs.addTab(self._scroll(self._build_camera_tab()), "Camera")
-        tabs.addTab(self._scroll(self._build_audio_tab()), "Audio")
+        self._audio_tab = self._scroll(self._build_audio_tab())
+        tabs.addTab(self._audio_tab, "Audio")
         self._out_tab = self._scroll(self._build_output_tab())
         tabs.addTab(self._out_tab, "Output")
         tabs.setFixedWidth(430)
@@ -1929,6 +1930,8 @@ class Main(QMainWindow):
         g = QGroupBox("Microphone: AI noise removal")
         gl = QVBoxLayout(g)
         self.mic_combo = QComboBox()
+        self.mic_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.mic_combo.setMinimumContentsLength(12)
         self.mic_combo.addItem("System default input", None)
         for name, desc in list_microphones():
             self.mic_combo.addItem(desc, name)
@@ -1947,7 +1950,27 @@ class Main(QMainWindow):
         gl.addWidget(self.mic_btn)
         gl.addWidget(_hint("DeepFilterNet3 uses a few % of one CPU core. Choose “R9700 Broadcast Mic” as the "
                            "microphone in Discord / Zoom / OBS."))
+        f = QFormLayout()
+        self.raw_meter = LevelBar()
+        self.ai_meter = LevelBar()
+        f.addRow("Input (raw)", self.raw_meter)
+        f.addRow("After AI", self.ai_meter)
+        gl.addLayout(f)
+        self.mic_combo.currentIndexChanged.connect(lambda _: self._update_meters(restart=True))
         v.addWidget(g)
+        g = QGroupBox("Recording levels")
+        f = QFormLayout(g)
+        self.mic_meter2 = LevelBar()
+        self.desk_meter2 = LevelBar()
+        self.rec_src_label = _hint("")
+        f.addRow("Microphone", self.mic_meter2)
+        f.addRow("Desktop audio", self.desk_meter2)
+        f.addRow(self.rec_src_label)
+        v.addWidget(g)
+        v.addWidget(_hint("Meters: green = good, yellow above −12 dB, red above −3 dB (too loud, may clip); the "
+                          "white tick is the last second's peak. Speak normally: peaks around −18 to −6 dB are "
+                          "ideal. Choose which mic and desktop audio are recorded in Output → Recording. "
+                          "Meters run only while this tab or the Output tab is open, or while recording."))
         v.addStretch(1)
         return w
 
@@ -1991,41 +2014,66 @@ class Main(QMainWindow):
         self.desk_combo.setCurrentIndex(max(0, self.desk_combo.findData(cur_desk)))
         self._update_meters(restart=True)
 
-    def _meter_targets(self):
-        from .media import resolve_audio, resolve_desktop
-        return {"mic": resolve_audio(self.audio_combo.currentData()),
-                "desk": resolve_desktop(self.desk_combo.currentData())}
+    def _meter_targets(self, keys):
+        from .media import STUDIO_MIC_NODE, resolve_audio, resolve_desktop
+        t = {}
+        if "mic" in keys:
+            t["mic"] = resolve_audio(self.audio_combo.currentData())
+        if "desk" in keys:
+            t["desk"] = resolve_desktop(self.desk_combo.currentData())
+        if "raw" in keys:
+            t["raw"] = self.mic_combo.currentData() or "@default"
+        if "ai" in keys:
+            t["ai"] = STUDIO_MIC_NODE if self.mic.running else None
+        return t
+
+    def _meter_bars(self):
+        return {"mic": (self.mic_meter, self.mic_meter2, self.mini_mic),
+                "desk": (self.desk_meter, self.desk_meter2, self.mini_desk),
+                "raw": (self.raw_meter,), "ai": (self.ai_meter,)}
 
     def _update_meters(self, restart=False):
-        """Run the level meters only while someone can see them: Output tab open, or recording."""
-        if not hasattr(self, "tabs") or not hasattr(self, "desk_combo"):
+        """Run level meters only while someone can see them: Output or Audio tab open, or recording."""
+        if not hasattr(self, "tabs") or not hasattr(self, "desk_combo") or not hasattr(self, "raw_meter"):
             return
         from .audio import LevelMeter
-        show = self.tabs.currentWidget() is self._out_tab or self.recording
-        targets = self._meter_targets() if show else {}
-        for kind, bar in (("mic", self.mic_meter), ("desk", self.desk_meter)):
+        cur = self.tabs.currentWidget()
+        keys = set()
+        if cur is self._out_tab or self.recording:
+            keys |= {"mic", "desk"}
+        if cur is self._audio_tab:
+            keys |= {"mic", "desk", "raw", "ai"}
+        targets = self._meter_targets(keys)
+        for kind, bars in self._meter_bars().items():
             m = self.meters.get(kind)
             tgt = targets.get(kind)
-            if m is not None and (restart or not show or m.target != tgt or not m.alive):
+            if m is not None and (restart or m.target != tgt or not m.alive):
                 m.stop()
                 self.meters.pop(kind)
                 m = None
-            if show and tgt and m is None:
+            if tgt and m is None:
                 try:
                     self.meters[kind] = LevelMeter(tgt)
                 except Exception as e:  # noqa: BLE001
                     self._on_error(f"level meter: {e}")
-            bar.active = kind in self.meters
-            bar.update()
+            for b in bars:
+                b.active = kind in self.meters
+                b.update()
         self.mini_meters.setVisible(self.recording)
         self.mini_desk.setVisible("desk" in self.meters)
+        if hasattr(self, "rec_src_label"):
+            mic = self.audio_combo.currentText() if self.audio_combo.currentData() != "none" else "no sound"
+            desk = self.desk_combo.currentText()
+            self.rec_src_label.setText(f"Recording uses: {mic} · desktop: {desk}"
+                                       + ("" if self.mic.running else "  ·  “After AI” needs the noise-removal "
+                                          "mic started"))
         if self.meters:
             self.meter_timer.start()
         else:
             self.meter_timer.stop()
 
     def _tick_meters(self):
-        for kind, bars in (("mic", (self.mic_meter, self.mini_mic)), ("desk", (self.desk_meter, self.mini_desk))):
+        for kind, bars in self._meter_bars().items():
             m = self.meters.get(kind)
             for b in bars:
                 b.active = m is not None

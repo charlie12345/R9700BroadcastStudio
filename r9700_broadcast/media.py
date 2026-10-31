@@ -144,9 +144,10 @@ def pw_target_args(target: str) -> list[str]:
     speaker/headset plays - desktop audio), or a source node name (a specific microphone)."""
     if target == "@default":
         return []
+    # dont-fallback: a missing device must give silence, never quietly record the default mic instead
     if target.endswith(".monitor"):
-        return ["--target", target[:-8], "-P", "{ stream.capture.sink = true }"]
-    return ["--target", target]
+        return ["--target", target[:-8], "-P", "{ stream.capture.sink = true node.dont-fallback = true }"]
+    return ["--target", target, "-P", "{ node.dont-fallback = true }"]
 
 
 def default_sink() -> str | None:
@@ -290,32 +291,57 @@ class Recorder:
             t.thread.start()
 
     def _audio_loop(self, t: _AudioTrack):
+        """Copy pw-record -> ffmpeg on the wall clock. If the device sends nothing (missing, unplugged,
+        suspended) the gap is filled with silence, so the track keeps time with the video and ffmpeg's
+        muxer never stalls waiting for it."""
+        import select
         frame = 2 * t.channels
         chunk = self.RATE // 50 * frame          # 20 ms of s16
-        src = t.proc.stdout
+        fd = t.proc.stdout.fileno()
+        bps = self.RATE * frame                  # bytes per second
         try:
             # audio from before the first video frame is discarded
             while not self._started.is_set() and not self._closing:
-                if not src.read(chunk):
-                    return
+                if select.select([fd], [], [], 0.05)[0] and not os.read(fd, 65536):
+                    fd = None
+                    break
+            t0 = time.perf_counter()
             # audio_offset_ms > 0 delays the sound (silence first), < 0 trims it
             off = int(self.audio_offset_ms * self.RATE / 1000) * frame
+            written = 0
             if off > 0:
                 os.write(t.fd_w, bytes(off))
-            elif off < 0:
-                src.read(-off)
+                written = off
+            trim = -off if off < 0 else 0
+            carry = b""
             while not self._closing:
-                b = src.read(chunk)
-                if not b:
-                    break
-                os.write(t.fd_w, b)
-            # the device went away (unplugged, bad target): keep the track going with silence so
-            # ffmpeg's muxer never waits on it and the file still closes cleanly
-            silence, t0, n = bytes(chunk), time.perf_counter(), 0
-            while not self._closing:
-                os.write(t.fd_w, silence)
-                n += 1
-                time.sleep(max(0.0, t0 + n * 0.02 - time.perf_counter()))
+                b = b""
+                if fd is not None and select.select([fd], [], [], 0.05)[0]:
+                    b = os.read(fd, chunk * 4)
+                    if not b:
+                        fd = None                # pw-record ended
+                elif fd is None:
+                    time.sleep(0.02)
+                if b:
+                    if trim:
+                        k = min(trim, len(b))
+                        trim -= k
+                        b = b[k:]
+                    b = carry + b
+                    n = len(b) - len(b) % frame  # whole sample frames only
+                    carry = b[n:]
+                    if n:
+                        os.write(t.fd_w, b[:n])
+                        written += n
+                    continue
+                # nothing arrived: pad to the wall clock once the gap is clearly a dropout
+                due = int((time.perf_counter() - t0) * bps) + max(off, 0) - trim
+                gap = due - written
+                if gap > bps * 0.25 and not carry:
+                    pad = gap - int(bps * 0.05)
+                    pad -= pad % frame
+                    os.write(t.fd_w, bytes(pad))
+                    written += pad
         except (BrokenPipeError, OSError, ValueError):
             pass
 

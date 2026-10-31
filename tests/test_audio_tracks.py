@@ -18,9 +18,9 @@ SINK = "r9700_tracks_test"
 
 def test_pw_target_args():
     assert pw_target_args("@default") == []
-    assert pw_target_args("alsa_input.x") == ["--target", "alsa_input.x"]
-    assert pw_target_args("alsa_output.y.monitor") == ["--target", "alsa_output.y", "-P",
-                                                       "{ stream.capture.sink = true }"]
+    assert pw_target_args("alsa_input.x") == ["--target", "alsa_input.x", "-P", "{ node.dont-fallback = true }"]
+    assert pw_target_args("alsa_output.y.monitor") == [
+        "--target", "alsa_output.y", "-P", "{ stream.capture.sink = true node.dont-fallback = true }"]
     assert resolve_desktop("none") is None
     assert resolve_desktop("alsa_output.y") == "alsa_output.y.monitor"
 
@@ -89,9 +89,16 @@ def test_missing_device_still_closes(tmp_path):
     t0 = time.time()
     rec.close()
     assert time.time() - t0 < 15
-    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
-                         capture_output=True, text=True, check=True).stdout.split()
-    assert out.count("video") == 1
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration", "-of",
+                          "csv=p=0", path], capture_output=True, text=True, check=True).stdout.split()
+    kinds = [o.split(",")[0] for o in out]
+    assert kinds.count("video") == 1 and kinds.count("audio") == 2
+    # never falls back to the default mic: the tracks are pure silence, as long as the video
+    for i in range(2):
+        pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-map", f"0:a:{i}", "-f", "s16le", "-ac", "1",
+                              "-"], capture_output=True, check=True).stdout
+        a = np.frombuffer(pcm, np.int16)
+        assert a.size > 48000 * 0.7 and np.abs(a).max() == 0
 
 
 def test_level_meter(null_sink):
