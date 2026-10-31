@@ -139,12 +139,69 @@ def resolve_audio(choice: str | None) -> str | None:
     return choice
 
 
+def pw_target_args(target: str) -> list[str]:
+    """pw-record arguments for a capture target: '@default' (default mic), '<sink>.monitor' (what a
+    speaker/headset plays - desktop audio), or a source node name (a specific microphone)."""
+    if target == "@default":
+        return []
+    if target.endswith(".monitor"):
+        return ["--target", target[:-8], "-P", "{ stream.capture.sink = true }"]
+    return ["--target", target]
+
+
+def default_sink() -> str | None:
+    try:
+        name = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True,
+                              timeout=3).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return None
+    return name or None
+
+
+def list_outputs() -> list[tuple[str, str]]:
+    """[(sink node.name, description)] of speakers/headsets whose sound can be recorded."""
+    out, name = [], None
+    try:
+        txt = subprocess.run(["pactl", "list", "sinks"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return out
+    for line in txt.splitlines():
+        line = line.strip()
+        if line.startswith("Name:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("Description:") and name:
+            out.append((name, line.split(":", 1)[1].strip()))
+            name = None
+    return out
+
+
+def resolve_desktop(choice: str | None) -> str | None:
+    """'none' | 'default' | a sink node name -> '<sink>.monitor' capture target (or None)."""
+    if not choice or choice == "none" or shutil.which("pw-record") is None:
+        return None
+    sink = default_sink() if choice == "default" else choice
+    return f"{sink}.monitor" if sink else None
+
+
+class _AudioTrack:
+    """One pw-record capture fed to ffmpeg through its own pipe."""
+
+    def __init__(self, target: str, channels: int, title: str):
+        self.target, self.channels, self.title = target, channels, title
+        self.fd_r, self.fd_w = os.pipe()
+        self.proc = None
+        self.thread = None
+
+
 class Recorder:
     """ffmpeg recorder with sound. 'h264'/'hevc' use the R9700 VCN (VAAPI); 'prores4444' keeps the
     alpha channel for editing in Resolve/Kdenlive (feed it RGBA).
 
-    A/V sync: the microphone is captured with pw-record and fed to ffmpeg through its own pipe,
-    starting at the instant the first video frame is written, so both streams start at t=0
+    Sound: track 1 = microphone (mono), optional track 2 = desktop audio (stereo, what a speaker /
+    headset plays), kept separate so they can be balanced in the editor.
+
+    A/V sync: each audio source is captured with pw-record and fed to ffmpeg through its own pipe,
+    starting at the instant the first video frame is written, so all streams start at t=0
     together. Video frames are timestamped by the wall clock as they arrive and ffmpeg emits
     constant frame rate (duplicating/dropping), so a dropped or late frame never shifts the sound.
     """
@@ -152,11 +209,28 @@ class Recorder:
     RATE = 48000
 
     def __init__(self, path, width, height, fps, codec="hevc", alpha=False, audio: str | None = None,
-                 audio_offset_ms: float = 0.0):
+                 audio_offset_ms: float = 0.0, crop=None, out_size: tuple[int, int] | None = None,
+                 desktop: str | None = None):
+        """audio: mic capture target (see pw_target_args). desktop: '<sink>.monitor' for a second,
+        stereo track of desktop sound. crop: a vertical.VerticalFrame - records only that window of
+        each frame (its position can move while recording; its size is fixed here). out_size: (w, h)
+        to scale to, e.g. 1080x1920."""
         self.alpha = alpha and codec == "prores4444"
         self.path = path
+        self.size, self.fps = (width, height), fps
+        self.crop = crop
+        self.crop_size = crop.size(width, height) if crop is not None else None
+        if self.crop_size:
+            width, height = self.crop_size
+        scale = out_size if out_size and tuple(out_size) != (width, height) else None
         self.audio_target = audio
+        self.desktop_target = desktop
         self.audio_offset_ms = audio_offset_ms
+        self.tracks: list[_AudioTrack] = []
+        if audio:
+            self.tracks.append(_AudioTrack(audio, 1, "Microphone"))
+        if desktop:
+            self.tracks.append(_AudioTrack(desktop, 2, "Desktop audio"))
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
         render = sorted(glob.glob("/dev/dri/renderD*"))
         vaapi = codec in ("hevc", "h264") and render
@@ -167,27 +241,38 @@ class Recorder:
         raw = ["-probesize", "32", "-analyzeduration", "0"]
         cmd += ["-thread_queue_size", "64", *raw, "-use_wallclock_as_timestamps", "1",
                 "-f", "rawvideo", "-pix_fmt", "bgra", "-s", f"{width}x{height}", "-i", "pipe:0"]
-        self._afd_r = self._afd_w = None
-        if audio:
-            self._afd_r, self._afd_w = os.pipe()
-            cmd += ["-thread_queue_size", "1024", *raw, "-f", "s16le", "-ar", str(self.RATE), "-ac", "1",
-                    "-i", f"pipe:{self._afd_r}"]
-        cmd += ["-map", "0:v"] + (["-map", "1:a"] if audio else [])
+        for t in self.tracks:
+            cmd += ["-thread_queue_size", "1024", *raw, "-f", "s16le", "-ar", str(self.RATE),
+                    "-ac", str(t.channels), "-i", f"pipe:{t.fd_r}"]
+        cmd += ["-map", "0:v"]
+        for i, _ in enumerate(self.tracks):
+            cmd += ["-map", f"{i + 1}:a"]
         cmd += ["-fps_mode", "cfr", "-r", str(fps)]
         if vaapi:
-            cmd += ["-vf", "format=nv12,hwupload", "-c:v", f"{codec}_vaapi", "-qp", "18"]
+            sv = f",scale_vaapi=w={scale[0]}:h={scale[1]}" if scale else ""
+            cmd += ["-vf", f"format=nv12,hwupload{sv}", "-c:v", f"{codec}_vaapi", "-qp", "18"]
+        elif scale:
+            cmd += ["-vf", f"scale={scale[0]}:{scale[1]}:flags=lanczos"]
+        if vaapi:
+            pass                                 # encoder chosen above
         elif codec == "prores4444":
             cmd += ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt",
                     "yuva444p10le" if self.alpha else "yuv444p10le"]
         else:
             cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p"]
-        if audio:
-            cmd += ["-c:a", "pcm_s16le"] if codec == "prores4444" else ["-c:a", "aac", "-b:a", "192k"]
+        for i, t in enumerate(self.tracks):
+            if codec == "prores4444":
+                cmd += [f"-c:a:{i}", "pcm_s16le"]
+            else:
+                cmd += [f"-c:a:{i}", "aac", f"-b:a:{i}", "192k" if t.channels == 1 else "256k"]
+            # MP4 keeps a track's name in handler_name, MOV/MKV in title: set both
+            cmd += [f"-metadata:s:a:{i}", f"title={t.title}", f"-metadata:s:a:{i}", f"handler_name={t.title}"]
+        if self.tracks:
+            cmd += ["-disposition:a:0", "default"]
         cmd.append(path)
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                     pass_fds=(self._afd_r,) if audio else ())
-        if audio:
-            os.close(self._afd_r)
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, pass_fds=tuple(t.fd_r for t in self.tracks))
+        for t in self.tracks:
+            os.close(t.fd_r)
         self._started = threading.Event()
         self._closing = False
         # frames go through a writer thread: a slow disk or encoder never stalls the virtual camera
@@ -196,40 +281,41 @@ class Recorder:
         self.dropped = 0
         self._vt = threading.Thread(target=self._video_loop, daemon=True)
         self._vt.start()
-        self._mic = None
-        self._at = None
-        if audio:
-            if audio == "@default":
-                tgt = []
-            elif audio.endswith(".monitor"):        # record what a sink plays (e.g. a test sink)
-                tgt = ["--target", audio[:-8], "-P", "{ stream.capture.sink = true }"]
-            else:
-                tgt = ["--target", audio]
-            self._mic = subprocess.Popen(["pw-record", "--raw", "--rate", str(self.RATE), "--channels", "1",
-                                          "--format", "s16", "--latency", "20ms", *tgt, "-"],
-                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            self._at = threading.Thread(target=self._audio_loop, daemon=True)
-            self._at.start()
+        for t in self.tracks:
+            t.proc = subprocess.Popen(["pw-record", "--raw", "--rate", str(self.RATE), "--channels",
+                                       str(t.channels), "--format", "s16", "--latency", "20ms",
+                                       *pw_target_args(t.target), "-"],
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            t.thread = threading.Thread(target=self._audio_loop, args=(t,), daemon=True)
+            t.thread.start()
 
-    def _audio_loop(self):
-        chunk = self.RATE // 50 * 2          # 20 ms of s16 mono
-        src = self._mic.stdout
+    def _audio_loop(self, t: _AudioTrack):
+        frame = 2 * t.channels
+        chunk = self.RATE // 50 * frame          # 20 ms of s16
+        src = t.proc.stdout
         try:
-            # mic audio from before the first video frame is discarded
+            # audio from before the first video frame is discarded
             while not self._started.is_set() and not self._closing:
                 if not src.read(chunk):
                     return
             # audio_offset_ms > 0 delays the sound (silence first), < 0 trims it
-            off = int(self.audio_offset_ms * self.RATE / 1000) * 2
+            off = int(self.audio_offset_ms * self.RATE / 1000) * frame
             if off > 0:
-                os.write(self._afd_w, bytes(off))
+                os.write(t.fd_w, bytes(off))
             elif off < 0:
                 src.read(-off)
             while not self._closing:
                 b = src.read(chunk)
                 if not b:
                     break
-                os.write(self._afd_w, b)
+                os.write(t.fd_w, b)
+            # the device went away (unplugged, bad target): keep the track going with silence so
+            # ffmpeg's muxer never waits on it and the file still closes cleanly
+            silence, t0, n = bytes(chunk), time.perf_counter(), 0
+            while not self._closing:
+                os.write(t.fd_w, silence)
+                n += 1
+                time.sleep(max(0.0, t0 + n * 0.02 - time.perf_counter()))
         except (BrokenPipeError, OSError, ValueError):
             pass
 
@@ -246,6 +332,8 @@ class Recorder:
                 return
 
     def send_bgra(self, bgra: np.ndarray):
+        if self.crop is not None:
+            bgra = self.crop.crop(bgra, self.crop_size)     # copies only the crop window below
         try:
             self._vq.put_nowait(np.array(bgra, copy=True, order="C"))  # caller reuses its buffer
         except Exception:  # noqa: BLE001 - queue full: encoder behind, drop (ffmpeg duplicates)
@@ -259,20 +347,20 @@ class Recorder:
         self._vq.put(None)
         self._vt.join(timeout=30)
         self._closing = True
-        if self._mic is not None:
-            self._mic.terminate()
+        for t in self.tracks:
+            t.proc.terminate()
             try:
-                self._mic.wait(timeout=3)
+                t.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                self._mic.kill()
-        if self._at is not None:
-            self._at.join(timeout=3)
-        if self._afd_w is not None:
-            try:
-                os.close(self._afd_w)
-            except OSError:
-                pass
-            self._afd_w = None
+                t.proc.kill()
+        for t in self.tracks:
+            t.thread.join(timeout=3)
+            if t.fd_w is not None:
+                try:
+                    os.close(t.fd_w)
+                except OSError:
+                    pass
+                t.fd_w = None
         if self.proc.stdin:
             try:
                 self.proc.stdin.close()

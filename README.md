@@ -317,14 +317,26 @@ plate and keeps a crisp chair cut-out (BiRefNet on the empty-room plate) in ever
 
 ## Recording with sound, snapshots and thumbnails
 
-* **● Rec** records video *and* sound: the AI noise-removed "R9700 Broadcast Mic" when it is on,
-  otherwise the default microphone (Output → Recording → Sound). The mic is captured with
+* **● Rec** records video *and* sound. Output → Recording → **Microphone** picks track 1: Auto (the AI
+  noise-removed "R9700 Broadcast Mic" when it is on, otherwise the system default), the AI mic, the
+  system default, or any specific microphone (⟳ rescans after plugging one in). **Desktop audio**
+  (off by default) adds track 2: what a speaker/headset plays (game, browser, call), stereo, kept
+  separate from the mic so you can balance them in Resolve / Kdenlive. Live **level meters** show
+  both while the Output tab is open, and a small pair sits next to ● Rec while recording. A device
+  that disappears mid-take is filled with silence; the file still closes cleanly. The mic is captured with
   `pw-record` into its own ffmpeg pipe, starting at the first video frame; video is stamped by the
   wall clock and written at constant frame rate, so dropped frames never shift the sound. Audio
   is delayed by the measured pipeline latency + 2 frames (camera); a ±200 ms lip-sync trim is
   there if needed. Measured flash/beep offset in the file: 16–36 ms, most of which is the test
   beep's own playback latency (`tests/av_sync.py`, on a private null sink). AAC 192k in MP4,
   PCM in ProRes MOV. Frames go through a writer thread: a slow disk never stalls the cameras.
+* **Vertical 9:16 (Shorts / Reels / TikTok)**: **Vertical 9:16** in the top bar shows/hides a template beside the
+  preview: a live 9:16 view with the apps' caption/button **safe zones** shaded, and a dashed frame on
+  the main preview. Drag either one to move the frame (also while recording); scroll or use **Zoom**
+  for a tighter crop. **Record** picks *Long form only*, *Vertical only* or *Long form + Vertical*;
+  ● Rec then writes `Longform_<name>.mp4` and/or `Vertical_<name>.mp4` (same sound, same length).
+  *Name* blank = date and time; an existing name gets ` (2)` instead of being overwritten. Vertical
+  is 1080×1920 (scaled on the VCN with `scale_vaapi`) or the native crop (608×1080 from 1080p).
 * **📷 Snapshot** saves the full-resolution output frame as PNG (transparent in the Transparent
   mode) to `~/Pictures/R9700 Broadcast/` and opens the **thumbnail maker**: 1280×720 cover crop,
   "pop" (contrast/colour), bold outlined title (auto-shrinks to fit), JPG under YouTube's 2 MB
