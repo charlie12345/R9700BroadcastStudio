@@ -152,9 +152,17 @@ class Recorder:
     RATE = 48000
 
     def __init__(self, path, width, height, fps, codec="hevc", alpha=False, audio: str | None = None,
-                 audio_offset_ms: float = 0.0):
+                 audio_offset_ms: float = 0.0, crop=None, out_size: tuple[int, int] | None = None):
+        """crop: a vertical.VerticalFrame - records only that window of each frame (its position can
+        move while recording; its size is fixed here). out_size: (w, h) to scale to, e.g. 1080x1920."""
         self.alpha = alpha and codec == "prores4444"
         self.path = path
+        self.size, self.fps = (width, height), fps
+        self.crop = crop
+        self.crop_size = crop.size(width, height) if crop is not None else None
+        if self.crop_size:
+            width, height = self.crop_size
+        scale = out_size if out_size and tuple(out_size) != (width, height) else None
         self.audio_target = audio
         self.audio_offset_ms = audio_offset_ms
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
@@ -175,7 +183,12 @@ class Recorder:
         cmd += ["-map", "0:v"] + (["-map", "1:a"] if audio else [])
         cmd += ["-fps_mode", "cfr", "-r", str(fps)]
         if vaapi:
-            cmd += ["-vf", "format=nv12,hwupload", "-c:v", f"{codec}_vaapi", "-qp", "18"]
+            sv = f",scale_vaapi=w={scale[0]}:h={scale[1]}" if scale else ""
+            cmd += ["-vf", f"format=nv12,hwupload{sv}", "-c:v", f"{codec}_vaapi", "-qp", "18"]
+        elif scale:
+            cmd += ["-vf", f"scale={scale[0]}:{scale[1]}:flags=lanczos"]
+        if vaapi:
+            pass                                 # encoder chosen above
         elif codec == "prores4444":
             cmd += ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt",
                     "yuva444p10le" if self.alpha else "yuv444p10le"]
@@ -246,6 +259,8 @@ class Recorder:
                 return
 
     def send_bgra(self, bgra: np.ndarray):
+        if self.crop is not None:
+            bgra = self.crop.crop(bgra, self.crop_size)     # copies only the crop window below
         try:
             self._vq.put_nowait(np.array(bgra, copy=True, order="C"))  # caller reuses its buffer
         except Exception:  # noqa: BLE001 - queue full: encoder behind, drop (ffmpeg duplicates)

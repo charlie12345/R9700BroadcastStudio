@@ -23,6 +23,7 @@ from . import annotate as AN
 from . import backgrounds as B
 from . import screencap
 from . import uvc
+from . import vertical as VT
 from .effects import (CAMEO_FILLS, CAMEO_RINGS, CAMEO_SHAPES, Settings, cameo_center,
                       cameo_from_point)
 from .matting import ENGINES
@@ -30,7 +31,7 @@ from .pipeline import PRESET_BY_KEY, PRESETS, LivePipeline
 
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
                       "r9700-broadcast", "config.json")
-RECORD_DIR = os.path.expanduser("~/Videos/R9700 Broadcast")
+RECORD_DIR = os.environ.get("R9700_BROADCAST_RECORD_DIR") or os.path.expanduser("~/Videos/R9700 Broadcast")
 ACCENT = "#e0263c"
 
 STYLE = f"""
@@ -179,7 +180,21 @@ class PreviewView(QWidget):
         self._r = QRect()
         self._drag = None                        # grab offset (image px) while dragging the bubble
         self._hover = False
+        self.vframe: VT.VerticalFrame | None = None   # set by Main while the vertical template is shown
+        self.vframe_size = None                       # locked crop size while recording vertical
+        self.on_vframe_moved = None
+        self._vdrag = None
         self.setMouseTracking(True)
+
+    def _vrect(self):
+        """Vertical crop in image pixels, or None when the template is hidden."""
+        if self.vframe is None or self.img is None:
+            return None
+        return self.vframe.rect(self.img.width(), self.img.height(), self.vframe_size)
+
+    def _vframe_hit(self, pt):
+        r = self._vrect()
+        return r is not None and pt is not None and r[0] <= pt[0] <= r[0] + r[2] and r[1] <= pt[1] <= r[1] + r[3]
 
     def set_frame(self, img: QImage, alpha: bool):
         self.img, self.alpha, self.message = img, alpha, ""
@@ -271,6 +286,10 @@ class PreviewView(QWidget):
             self._drag = (pt[0] - cx, pt[1] - cy)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.update()
+        elif e.button() == Qt.MouseButton.LeftButton and self._vframe_hit(pt):
+            W, H = self.img.width(), self.img.height()
+            self._vdrag = (pt[0] - self.vframe.x * W, pt[1] - self.vframe.y * H)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, e):
         if self._draw_tool():
@@ -286,7 +305,17 @@ class PreviewView(QWidget):
                                                     pt[0] - self._drag[0], pt[1] - self._drag[1])
             self.update()
             return
-        hover = self._cameo_hit(pt)
+        if self._vdrag is not None and pt is not None:
+            W, H = self.img.width(), self.img.height()
+            vf = self.vframe
+            vf.x, vf.y = (pt[0] - self._vdrag[0]) / W, (pt[1] - self._vdrag[1]) / H
+            x0, y0, w, h = vf.rect(W, H, self.vframe_size)
+            vf.x, vf.y = (x0 + w / 2) / W, (y0 + h / 2) / H
+            if self.on_vframe_moved:
+                self.on_vframe_moved(False)
+            self.update()
+            return
+        hover = self._cameo_hit(pt) or (self._vframe_hit(pt) and not self._draw_tool())
         if hover != self._hover:
             self._hover = hover
             self.setCursor(Qt.CursorShape.OpenHandCursor if hover else Qt.CursorShape.ArrowCursor)
@@ -305,6 +334,11 @@ class PreviewView(QWidget):
             if self.on_cameo_moved:
                 self.on_cameo_moved()
             self.update()
+        if self._vdrag is not None:
+            self._vdrag = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor if self._hover else Qt.CursorShape.ArrowCursor)
+            if self.on_vframe_moved:
+                self.on_vframe_moved(True)
 
     def wheelEvent(self, e):
         if self._cameo_hit(self._to_img(e.position())) and self.on_cameo_resized:
@@ -340,6 +374,106 @@ class PreviewView(QWidget):
                 p.drawEllipse(box)
             else:
                 p.drawRect(box)
+        vr = self._vrect()
+        if vr is not None:
+            # vertical template: dim what the 9:16 recording leaves out, outline what it keeps
+            k = r.width() / self.img.width()
+            box = QRectF(r.x() + vr[0] * k, r.y() + vr[1] * k, vr[2] * k, vr[3] * k)
+            shade = QColor(0, 0, 0, 90)
+            p.fillRect(QRectF(r.x(), r.y(), box.x() - r.x(), r.height()), shade)
+            p.fillRect(QRectF(box.right(), r.y(), r.right() + 1 - box.right(), r.height()), shade)
+            p.fillRect(QRectF(box.x(), r.y(), box.width(), box.y() - r.y()), shade)
+            p.fillRect(QRectF(box.x(), box.bottom(), box.width(), r.bottom() + 1 - box.bottom()), shade)
+            p.setPen(QPen(QColor(ACCENT), 2, Qt.PenStyle.DashLine))
+            p.drawRect(box)
+            p.setPen(QColor("#ffffff"))
+            p.drawText(box.adjusted(6, 4, 0, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, "9:16")
+
+
+class VerticalView(QWidget):
+    """Live 9:16 picture of the vertical crop with the apps' UI safe zones on top. Drag = pan,
+    scroll = zoom (zoom is locked while a vertical recording runs)."""
+
+    def __init__(self, preview: PreviewView, vframe: VT.VerticalFrame):
+        super().__init__()
+        self.preview, self.vframe = preview, vframe
+        self.safe = True
+        self.on_moved = None
+        self.on_zoom = None
+        self._drag = None
+        self.setMinimumSize(180, 320)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Drag to move the 9:16 frame · scroll to zoom")
+
+    def _box(self):
+        w = min(self.width(), int(self.height() * VT.ASPECT))
+        h = int(w / VT.ASPECT)
+        return QRect((self.width() - w) // 2, (self.height() - h) // 2, w, h)
+
+    def mousePressEvent(self, e):
+        img = self.preview.img
+        if e.button() == Qt.MouseButton.LeftButton and img is not None:
+            self._drag = (e.position(), self.vframe.x, self.vframe.y)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e):
+        img = self.preview.img
+        if self._drag is None or img is None:
+            return
+        W, H = img.width(), img.height()
+        _, _, cw, ch = self.vframe.rect(W, H, self.preview.vframe_size)
+        k = cw / max(1, self._box().width())          # widget px -> image px
+        d = e.position() - self._drag[0]
+        # grab-the-picture feel: dragging right shows more of the left side
+        self.vframe.x = self._drag[1] - d.x() * k / W
+        self.vframe.y = self._drag[2] - d.y() * k / H
+        x0, y0, w, h = self.vframe.rect(W, H, self.preview.vframe_size)
+        self.vframe.x, self.vframe.y = (x0 + w / 2) / W, (y0 + h / 2) / H
+        if self.on_moved:
+            self.on_moved(False)
+
+    def mouseReleaseEvent(self, e):
+        if self._drag is not None:
+            self._drag = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            if self.on_moved:
+                self.on_moved(True)
+
+    def wheelEvent(self, e):
+        if self.on_zoom:
+            self.on_zoom(self.vframe.zoom * 1.06 ** (e.angleDelta().y() / 120))
+        e.accept()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#0b0b0e"))
+        box = self._box()
+        img = self.preview.img
+        if img is None:
+            p.setPen(QColor("#8b8d9a"))
+            p.drawText(box, Qt.AlignmentFlag.AlignCenter, "9:16")
+            return
+        x0, y0, w, h = self.vframe.rect(img.width(), img.height(), self.preview.vframe_size)
+        if self.preview.alpha:
+            p.drawTiledPixmap(box, self.preview._checker)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.drawImage(box, img, QRect(x0, y0, w, h))
+        if self.safe:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            for name, (fx, fy, fw, fh) in VT.SAFE_ZONES.items():
+                z = QRectF(box.x() + fx * box.width(), box.y() + fy * box.height(),
+                           fw * box.width(), fh * box.height())
+                p.fillRect(z, QColor(224, 38, 60, 45))
+                p.setPen(QPen(QColor(255, 255, 255, 110), 1, Qt.PenStyle.DashLine))
+                p.drawRect(z)
+            # thirds guide for eye line
+            p.setPen(QPen(QColor(255, 255, 255, 60), 1))
+            for i in (1, 2):
+                yy = box.y() + box.height() * i / 3
+                p.drawLine(QPointF(box.x(), yy), QPointF(box.right(), yy))
+        p.setPen(QPen(QColor(ACCENT), 2))
+        p.drawRect(box.adjusted(0, 0, -1, -1))
 
 
 class RegionDialog(QDialog):
@@ -453,9 +587,14 @@ class Main(QMainWindow):
         self.ann = AN.Annotator()
         self.uvc_ctrls = {}
         self.uvc_dev = None
+        vc = self.cfg.get("vertical", {})
+        self.vframe = VT.VerticalFrame(float(vc.get("x", 0.5)), float(vc.get("y", 0.5)),
+                                       float(vc.get("zoom", 1.0)))
+        self.rec_mode = self.cfg.get("rec_mode", "long") if self.cfg.get("rec_mode") in VT.REC_MODES else "long"
+        self.recording = False
 
         self.bridge = Bridge()
-        self.bridge.preview.connect(lambda img, a: self.view.set_frame(img, a))
+        self.bridge.preview.connect(self._on_preview)
         self.bridge.status.connect(lambda s: self.status.setText(s))
         self.bridge.lock.connect(self._on_lock_status)
         self.bridge.snapshot.connect(self._on_snapshot)
@@ -487,6 +626,8 @@ class Main(QMainWindow):
         left.addWidget(self.errlabel)
         left.addWidget(self._build_strip())
         outer.addLayout(left, 1)
+        self.vpanel = self._build_vertical_panel()
+        outer.addWidget(self.vpanel)
         tabs = QTabWidget()
         tabs.addTab(self._scroll(self._build_bg_tab()), "Background")
         tabs.addTab(self._scroll(self._build_layout_tab()), "Layout")
@@ -523,6 +664,12 @@ class Main(QMainWindow):
         elif bg and os.path.exists(bg):
             self._set_background(bg, switch_mode=False)
         self._select_mode_tile(self.settings.mode)
+        self._show_vertical(bool(self.cfg.get("vertical_panel", True)), save=False)
+
+    def _on_preview(self, img, a):
+        self.view.set_frame(img, a)
+        if self.vpanel.isVisible():
+            self.vview.update()
 
     # ---- config ---------------------------------------------------------------------------------
     def _load_config(self):
@@ -551,7 +698,7 @@ class Main(QMainWindow):
     def _emit_status(self, p: LivePipeline):
         st, src = p.stats, p.source
         outs = " · ".join({"pipewire": "PipeWire cam", "v4l2": "V4L2 cam", "v4l2alpha": "V4L2 alpha cam",
-                           "record": "● REC"}.get(k, k)
+                           "record": "● REC", "record_v": "● REC 9:16"}.get(k, k)
                           for k in p.outputs)
         eng = p.studio.engine_kind if p.studio else "loading…"
         plate = ""
@@ -689,11 +836,16 @@ class Main(QMainWindow):
         self.v4_btn.setToolTip("Classic /dev/video camera for Zoom, Discord, Teams (needs v4l2loopback)")
         self.v4_btn.toggled.connect(lambda on: self._set_output("v4l2", on))
         h.addWidget(self.v4_btn)
-        self.rec_btn = QPushButton("● Rec")
+        self.rec_btn = QPushButton({"vertical": "● Rec 9:16", "both": "● Rec ×2"}.get(self.rec_mode, "● Rec"))
         self.rec_btn.setObjectName("live")
         self.rec_btn.setCheckable(True)
         self.rec_btn.toggled.connect(self._toggle_record)
         h.addWidget(self.rec_btn)
+        self.vert_btn = QPushButton("Vertical 9:16")
+        self.vert_btn.setCheckable(True)
+        self.vert_btn.setToolTip("Show the vertical (9:16) recording template beside the preview")
+        self.vert_btn.toggled.connect(self._show_vertical)
+        h.addWidget(self.vert_btn)
         self.snap_btn = QPushButton("📷 Snapshot")
         self.snap_btn.setToolTip("Save the current output frame at full resolution and open the thumbnail maker.\n"
                                  "Timer: Output tab → Recording.")
@@ -804,35 +956,161 @@ class Main(QMainWindow):
             elif not on and cur is not None:
                 p._swap_output(name, None)
 
+    def _rec_label(self):
+        return {"long": "● Rec", "vertical": "● Rec 9:16", "both": "● Rec ×2"}[self.rec_mode]
+
     def _toggle_record(self, on):
+        self.recording = on
         if on:
             codec = self.codec_combo.currentData()
             audio_choice = self.audio_combo.currentData()
             audio_adj = float(self.audio_sync.value())
+            mode = self.rec_mode
+            name = self.take_name.text()
+            vsize_key = self.vsize_combo.currentData()
+            vframe = self.vframe
+            if mode != "long" and self.view.img is not None:
+                # lock the crop size for this take (position stays live)
+                self.view.vframe_size = vframe.size(self.view.img.width(), self.view.img.height())
 
             def do(p):
-                from .media import Recorder
+                from .media import Recorder, resolve_audio
                 if p.source is None:
                     return
                 os.makedirs(RECORD_DIR, exist_ok=True)
                 ext = "mov" if codec == "prores4444" else "mp4"
-                path = os.path.join(RECORD_DIR, time.strftime(f"%Y-%m-%d %H-%M-%S.{ext}"))
-                from .media import resolve_audio
+                paths = VT.recording_paths(RECORD_DIR, mode, ext, name)
                 fps = max(1, int(round(p.source.fps)))
+                W, H = p.source.width, p.source.height
                 # the picture reaches the recorder later than the sound (camera + processing):
                 # delay the audio by the measured pipeline latency + ~2 frames of camera latency
                 offset = p.stats.latency_ms + 2000 / fps + audio_adj
-                rec = Recorder(path, p.source.width, p.source.height, fps, codec,
-                               alpha=codec == "prores4444", audio=resolve_audio(audio_choice),
-                               audio_offset_ms=offset)
-                p._swap_output("record", rec)
-                self.bridge.error.emit("Recording" + (f" with sound ({rec.audio_target})" if rec.audio_target
-                                                      else " without sound") + f" → {path}")
+                audio = resolve_audio(audio_choice)
+                msgs = []
+                for kind, path in paths.items():
+                    try:
+                        if kind == "vertical":
+                            crop_size = vframe.size(W, H)
+                            rec = Recorder(path, W, H, fps, codec, alpha=codec == "prores4444", audio=audio,
+                                           audio_offset_ms=offset, crop=vframe,
+                                           out_size=VT.output_size(vsize_key, crop_size))
+                            p._swap_output("record_v", rec)
+                        else:
+                            rec = Recorder(path, W, H, fps, codec, alpha=codec == "prores4444", audio=audio,
+                                           audio_offset_ms=offset)
+                            p._swap_output("record", rec)
+                        msgs.append(os.path.basename(path))
+                    except Exception as e:  # noqa: BLE001
+                        self.bridge.error.emit(f"{kind} recording failed: {e}")
+                self.bridge.error.emit("Recording" + (f" with sound ({audio})" if audio else " without sound")
+                                       + " → " + " + ".join(msgs))
             self.pipe.command(do)
         else:
             self.pipe.remove_output("record")
+            self.pipe.remove_output("record_v")
+            self.view.vframe_size = None
             self._on_error(f"Saved to {RECORD_DIR}")
-        self.rec_btn.setText("■ Stop" if on else "● Rec")
+        self.rec_btn.setText("■ Stop" if on else self._rec_label())
+        for wdg in (self.rec_mode_combo, self.vsize_combo, self.vzoom_slider, self.take_name):
+            wdg.setEnabled(not on)
+
+    # ---- vertical template ---------------------------------------------------------------------
+    def _build_vertical_panel(self):
+        f = QFrame()
+        f.setObjectName("strip")
+        f.setFixedWidth(300)
+        v = QVBoxLayout(f)
+        head = QHBoxLayout()
+        t = QLabel("Vertical 9:16")
+        t.setStyleSheet(f"color:{ACCENT}; font-weight:600")
+        head.addWidget(t, 1)
+        close = QPushButton("✕")
+        close.setFixedWidth(28)
+        close.setToolTip("Hide the vertical template (recording mode is kept)")
+        close.clicked.connect(lambda: self.vert_btn.setChecked(False))
+        head.addWidget(close)
+        v.addLayout(head)
+        self.vview = VerticalView(self.view, self.vframe)
+        self.vview.safe = bool(self.cfg.get("vertical_safe", True))
+        self.vview.on_moved = self._on_vframe_moved
+        self.vview.on_zoom = lambda z: None if self.recording and self.rec_mode != "long" \
+            else self.vzoom_slider.set_value(min(2.5, max(1.0, z)))
+        self.view.on_vframe_moved = self._on_vframe_moved
+        v.addWidget(self.vview, 1)
+        form = QFormLayout()
+        self.rec_mode_combo = QComboBox()
+        for k, lab in VT.REC_MODES.items():
+            self.rec_mode_combo.addItem(lab, k)
+        self.rec_mode_combo.setCurrentIndex(self.rec_mode_combo.findData(self.rec_mode))
+        self.rec_mode_combo.setToolTip("What ● Rec records. Files: Longform_<name> and Vertical_<name>, "
+                                       "same name for both files of one take.")
+        self.rec_mode_combo.activated.connect(self._on_rec_mode)
+        form.addRow("Record", self.rec_mode_combo)
+        self.take_name = QLineEdit(self.cfg.get("take_name", ""))
+        self.take_name.setPlaceholderText("date + time")
+        self.take_name.setToolTip("Name for the next take: Longform_<name>.mp4 / Vertical_<name>.mp4.\n"
+                                  "Blank = date and time. An existing name gets ' (2)' etc., never overwritten.")
+        self.take_name.editingFinished.connect(lambda: self._cfg_set("take_name", self.take_name.text()))
+        form.addRow("Name", self.take_name)
+        self.vsize_combo = QComboBox()
+        self.vsize_combo.addItem("1080×1920 (Shorts / Reels / TikTok)", "1080x1920")
+        self.vsize_combo.addItem("Native crop (no scaling)", "native")
+        self.vsize_combo.setCurrentIndex(max(0, self.vsize_combo.findData(self.cfg.get("vertical_size", "1080x1920"))))
+        self.vsize_combo.activated.connect(lambda _: self._cfg_set("vertical_size", self.vsize_combo.currentData()))
+        form.addRow("Size", self.vsize_combo)
+        v.addLayout(form)
+        zf = QFormLayout()
+        self.vzoom_slider = self._slider(zf, "Zoom", None, 1.0, 2.5, 0.05, "{:.2f}×",
+                                         on_change=self._on_vzoom, value=self.vframe.zoom)
+        v.addLayout(zf)
+        row = QHBoxLayout()
+        safe = QCheckBox("Safe zones")
+        safe.setChecked(self.vview.safe)
+        safe.setToolTip("Shade where TikTok / Reels / Shorts put captions and buttons over the video")
+        safe.toggled.connect(lambda on: (setattr(self.vview, "safe", on), self.vview.update(),
+                                         self._cfg_set("vertical_safe", on)))
+        row.addWidget(safe, 1)
+        centre = QPushButton("Centre")
+        centre.clicked.connect(self._centre_vframe)
+        row.addWidget(centre)
+        v.addLayout(row)
+        v.addWidget(_hint("Drag here or the dashed frame on the preview to move it — also while recording."))
+        return f
+
+    def _show_vertical(self, on, save=True):
+        if not save:
+            self._vstartup = True
+        if self.vert_btn.isChecked() != on:
+            self.vert_btn.setChecked(on)      # re-enters through toggled with the same value
+            self._vstartup = False
+            return
+        self.vpanel.setVisible(on)
+        self.view.vframe = self.vframe if on else None
+        self.view.update()
+        if not getattr(self, "_vstartup", False):   # only a user's click is remembered, not the startup default
+            self._cfg_set("vertical_panel", on)
+        if not save:
+            self._vstartup = False
+
+    def _on_rec_mode(self, _):
+        self.rec_mode = self.rec_mode_combo.currentData()
+        self.rec_btn.setText(self._rec_label())
+        self._cfg_set("rec_mode", self.rec_mode)
+
+    def _on_vzoom(self, z):
+        self.vframe.zoom = z
+        self._on_vframe_moved(True)
+
+    def _centre_vframe(self):
+        self.vframe.x = self.vframe.y = 0.5
+        self._on_vframe_moved(True)
+
+    def _on_vframe_moved(self, save):
+        self.view.update()
+        self.vview.update()
+        if save:
+            self._cfg_set("vertical", {"x": round(self.vframe.x, 4), "y": round(self.vframe.y, 4),
+                                       "zoom": round(self.vframe.zoom, 3)})
 
     # ---- background strip ----------------------------------------------------------------------
     def _build_strip(self):
@@ -1679,7 +1957,9 @@ class Main(QMainWindow):
         gl.addLayout(f)
         gl.addWidget(_hint(f"Videos: {RECORD_DIR}. Snapshots and thumbnails: ~/Pictures/R9700 Broadcast. "
                            "Sound is synced automatically (pipeline latency is compensated); use the trim only if "
-                           "lips look early (−) or late (+). Use ProRes with the Transparent tile to keep alpha."))
+                           "lips look early (−) or late (+). Use ProRes with the Transparent tile to keep alpha.<br>"
+                           "<b>Vertical 9:16</b> (button in the top bar): record Long form, Vertical or both at once "
+                           "→ Longform_&lt;name&gt; / Vertical_&lt;name&gt;."))
         v.addWidget(g)
         g = QGroupBox("GPUs")
         gl = QVBoxLayout(g)
@@ -1774,3 +2054,17 @@ def _test_action(w: Main, action: str):
         w._place_cameo(x, y)
     elif action.startswith("bgblur="):
         w.settings.bg_blur = float(action[7:])
+    elif action == "vertical":
+        w.vert_btn.setChecked(True)
+    elif action.startswith("recmode="):
+        w.rec_mode_combo.setCurrentIndex(w.rec_mode_combo.findData(action[8:]))
+        w.rec_mode_combo.activated.emit(w.rec_mode_combo.currentIndex())
+    elif action.startswith("vx="):
+        w.vframe.x = float(action[3:])
+        w._on_vframe_moved(False)
+    elif action == "rec":
+        w.rec_btn.setChecked(True)
+    elif action == "stop":
+        w.rec_btn.setChecked(False)
+    elif action == "wait":
+        pass
